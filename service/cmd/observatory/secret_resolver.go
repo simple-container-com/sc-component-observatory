@@ -1,0 +1,75 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) Simple Container
+
+package main
+
+import (
+	"context"
+	"log/slog"
+	"strings"
+
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+)
+
+// resolveAWSSecretARN returns the plaintext SecretString when `raw`
+// is an `arn:aws:secretsmanager:*` ARN, else returns `raw` verbatim.
+// `name` is a caller-provided label (e.g. "SERVICE_JWT_SECRET",
+// "OBSERVATORY_OPERATOR_PASSWORD") used only for the "resolving X from ARN"
+// log line — never for lookups.
+//
+// Ported verbatim from sc-component-backup, which learned both of the
+// failure modes below the hard way. Keeping the original reasoning
+// attached because a future reader will otherwise be tempted to
+// "simplify" this into os.Getenv and reintroduce them.
+//
+// Why: sc-plugin-aws wires `cfg.Secrets[*]` entries onto the Lambda's
+// environment as SecretsManager ARNs (the fleet convention — plaintext
+// never lands in Lambda env). The Lambda runtime does NOT dereference
+// those ARNs; `os.Getenv("SERVICE_JWT_SECRET")` returns the ARN string.
+//
+// Paths that depend on the RESOLVED value:
+//   - The plugin's ComputeProcessor mints a JWT with the resolved
+//     signingKey at provision time, and the service MUST validate with
+//     the same resolved value or every push-register call is 401. Live-
+//     caught 2026-11-14 on backup-smoke-1d: plugin signs with the 64-
+//     char hex, service validates with the 115-char ARN → mismatch.
+//   - OBSERVATORY_OPERATOR_PASSWORD: the SPA login handler reads this as
+//     the operator's shared secret. Without resolution the service
+//     compares against the ARN string and no human-typeable value
+//     matches. Live-caught 2026-11-18 on the first fleet-roll
+//     backup.simple-forge.com login after the Component-ingress wire
+//     landed — PR #1816 workaround used to pre-resolve the value into
+//     `env.BACKUP_OPERATOR_PASSWORD` at deploy time; the generic
+//     secret-env wire (PR #1817) replaced it with an ARN that the
+//     service was never taught to resolve.
+//   - The service's own session-cookie JWT is self-consistent (signs +
+//     validates with whatever the env holds) — breaking it is NOT the
+//     direct symptom, but every cross-process JWT from an operator / CI
+//     smoke that minted with the resolved value also hits 401.
+//
+// Resolution happens once at startup; failures exit 2 so a misconfigured
+// deploy surfaces the mistake rather than running with the ARN-as-key
+// and 401-looping.
+func resolveAWSSecretARN(ctx context.Context, name, raw string) (string, error) {
+	if !strings.HasPrefix(raw, "arn:aws:secretsmanager:") {
+		return raw, nil
+	}
+	slog.Info("resolving env var from SecretsManager ARN", "name", name)
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return "", err
+	}
+	sm := secretsmanager.NewFromConfig(cfg)
+	out, err := sm.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{SecretId: &raw})
+	if err != nil {
+		return "", err
+	}
+	if out.SecretString != nil {
+		return *out.SecretString, nil
+	}
+	if len(out.SecretBinary) > 0 {
+		return string(out.SecretBinary), nil
+	}
+	return "", nil
+}
