@@ -261,3 +261,102 @@ func TestDelete_RemovesHistoryToo(t *testing.T) {
 		t.Errorf("second delete should be a no-op, got %v", err)
 	}
 }
+
+// TestRegister_PreservesClientConfigAndRegions extends the
+// preserve-on-empty rule to the fields added for the dashboard. Same
+// reasoning as Sources: a plugin version that does not send the client
+// config, or a deploy that could not read it, must not erase what an
+// earlier deploy captured — otherwise a detail view silently empties
+// out after an unrelated redeploy.
+func TestRegister_PreservesClientConfigAndRegions(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryStore()
+
+	rich := awsRecord("svc--staging", "v1")
+	rich.ClientConfig = map[string]any{"template": "lambda", "timeout": 30}
+	rich.Regions = []string{"eu-central-1", "us-east-1"}
+	rich.HealthPath = "/custom/health"
+	if _, err := Register(ctx, store, rich, t0); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	bare := ServiceRecord{Stack: "svc--staging", Cloud: CloudAWS, Template: "lambda", Version: "v2"}
+	got, err := Register(ctx, store, bare, t0.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if len(got.ClientConfig) == 0 {
+		t.Error("ClientConfig wiped by a deploy that did not report one")
+	}
+	if len(got.Regions) != 2 {
+		t.Errorf("Regions wiped: %+v", got.Regions)
+	}
+	if got.HealthPath != "/custom/health" {
+		t.Errorf("HealthPath wiped: %q", got.HealthPath)
+	}
+	if got.Version != "v2" {
+		t.Errorf("version should still advance: %q", got.Version)
+	}
+}
+
+// TestHealthStore_RoundTripAndLatest — per-region latest, newest-first
+// history, and pruning by age.
+func TestHealthStore_RoundTripAndLatest(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryStore()
+
+	for i, tc := range []struct {
+		region string
+		status string
+		offset time.Duration
+	}{
+		{"eu-central-1", HealthUp, 0},
+		{"eu-central-1", HealthDown, time.Hour},
+		{"us-east-1", HealthUp, 30 * time.Minute},
+	} {
+		if err := store.PutHealth(ctx, HealthResult{
+			Stack: "svc--staging", Region: tc.region, Status: tc.status,
+			At: t0.Add(tc.offset), HTTPStatus: 200, LatencyMS: int64(10 + i),
+		}); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+
+	hist, err := store.HealthHistory(ctx, "svc--staging", 0)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(hist) != 3 {
+		t.Fatalf("want 3, got %d", len(hist))
+	}
+	if !hist[0].At.Equal(t0.Add(time.Hour)) {
+		t.Errorf("history not newest-first: %v", hist[0].At)
+	}
+
+	latest, err := store.LatestHealth(ctx, "svc--staging")
+	if err != nil {
+		t.Fatalf("latest: %v", err)
+	}
+	if len(latest) != 2 {
+		t.Fatalf("want 2 regions, got %d", len(latest))
+	}
+	if latest["eu-central-1"].Status != HealthDown {
+		t.Errorf("eu-central-1 latest should be the newer down result: %+v", latest["eu-central-1"])
+	}
+	if latest["us-east-1"].Status != HealthUp {
+		t.Errorf("us-east-1: %+v", latest["us-east-1"])
+	}
+
+	// Prune everything older than t0+45m — drops the two early results.
+	n, err := store.PruneHealth(ctx, t0.Add(45*time.Minute))
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("want 2 pruned, got %d", n)
+	}
+	remaining, _ := store.HealthHistory(ctx, "svc--staging", 0)
+	if len(remaining) != 1 {
+		t.Errorf("want 1 remaining, got %d", len(remaining))
+	}
+}

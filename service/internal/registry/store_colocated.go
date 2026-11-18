@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/simple-container-com/sc-component-observatory/service/internal/storage"
 )
@@ -185,9 +186,12 @@ func (s *ColocatedStore) Put(ctx context.Context, rec ServiceRecord) error {
 // event delete must not leave the record itself behind and make them
 // run it again.
 func (s *ColocatedStore) Delete(ctx context.Context, stack string) error {
-	events, err := s.objects.List(ctx, s.deployPrefix(stack))
-	if err == nil {
-		for _, o := range events {
+	for _, prefix := range []string{s.deployPrefix(stack), s.healthPrefix(stack)} {
+		objs, err := s.objects.List(ctx, prefix)
+		if err != nil {
+			continue
+		}
+		for _, o := range objs {
 			_ = s.objects.Delete(ctx, o.Path)
 		}
 	}
@@ -248,3 +252,100 @@ func (s *ColocatedStore) DeployHistory(ctx context.Context, stack string, limit 
 }
 
 func (s *ColocatedStore) Close(_ context.Context) error { return nil }
+
+const healthDir = "health"
+
+func (s *ColocatedStore) healthPrefix(stack string) string {
+	return s.key(healthDir, encodeStack(stack)) + "/"
+}
+
+// healthObjectKey sorts lexically by time, so a prefix LIST returns
+// results in chronological order without reading every object. RFC3339
+// with a nanosecond suffix keeps two probes in the same second distinct.
+func (s *ColocatedStore) healthObjectKey(res HealthResult) string {
+	ts := res.At.UTC().Format("2006-01-02T15-04-05.000000000")
+	region := res.Region
+	if region == "" {
+		region = "default"
+	}
+	return s.healthPrefix(res.Stack) + ts + "_" + encodeStack(region) + jsonFileExt
+}
+
+func (s *ColocatedStore) PutHealth(ctx context.Context, res HealthResult) error {
+	if res.Stack == "" {
+		return errors.New("health result has no stack")
+	}
+	return s.putJSON(ctx, s.healthObjectKey(res), res)
+}
+
+func (s *ColocatedStore) HealthHistory(ctx context.Context, stack string, limit int) ([]HealthResult, error) {
+	objs, err := s.objects.List(ctx, s.healthPrefix(stack))
+	if err != nil {
+		return nil, fmt.Errorf("list health: %w", err)
+	}
+	// Keys are time-ordered, so sort by key DESC and read only as many
+	// as asked for. Reading every object to sort by its decoded
+	// timestamp would turn a 50-row page into thousands of GETs on a
+	// service that has been probed every 5 minutes for a month.
+	sort.Slice(objs, func(i, j int) bool { return objs[i].Path > objs[j].Path })
+	want := len(objs)
+	if limit > 0 && limit < want {
+		want = limit
+	}
+	out := make([]HealthResult, 0, want)
+	for _, o := range objs {
+		if len(out) >= want {
+			break
+		}
+		if !strings.HasSuffix(o.Path, jsonFileExt) {
+			continue
+		}
+		var res HealthResult
+		found, err := s.getJSON(ctx, o.Path, &res)
+		if err != nil || !found {
+			continue
+		}
+		out = append(out, res)
+	}
+	return out, nil
+}
+
+func (s *ColocatedStore) LatestHealth(ctx context.Context, stack string) (map[string]HealthResult, error) {
+	// One page is enough to cover every region's latest result in any
+	// realistic deployment, and bounds the GETs.
+	hist, err := s.HealthHistory(ctx, stack, 50)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]HealthResult{}
+	for _, r := range hist {
+		if _, seen := out[r.Region]; !seen {
+			out[r.Region] = r
+		}
+	}
+	return out, nil
+}
+
+// PruneHealth deletes results older than `before`.
+//
+// Relies on the key's time prefix rather than decoding each object, so
+// the sweep costs one LIST plus a DELETE per expired key.
+func (s *ColocatedStore) PruneHealth(ctx context.Context, before time.Time) (int, error) {
+	objs, err := s.objects.List(ctx, s.key(healthDir)+"/")
+	if err != nil {
+		return 0, fmt.Errorf("list health for prune: %w", err)
+	}
+	cutoff := before.UTC().Format("2006-01-02T15-04-05.000000000")
+	pruned := 0
+	for _, o := range objs {
+		base := path.Base(o.Path)
+		// Compare the lexical time prefix; same ordering property the
+		// key format is chosen for.
+		if i := strings.Index(base, "_"); i > 0 && base[:i] < cutoff {
+			if err := s.objects.Delete(ctx, o.Path); err == nil {
+				pruned++
+			}
+		}
+	}
+	return pruned, nil
+}

@@ -34,15 +34,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
+	sdkservice "github.com/simple-container-com/go-aws-lambda-sdk/pkg/service"
+
 	"github.com/simple-container-com/sc-component-observatory/service/internal/api"
+	"github.com/simple-container-com/sc-component-observatory/service/internal/health"
 	"github.com/simple-container-com/sc-component-observatory/service/internal/registry"
 	"github.com/simple-container-com/sc-component-observatory/service/internal/storage"
+	"github.com/simple-container-com/sc-component-observatory/service/internal/ui"
 )
 
 // version is stamped at build time via -ldflags "-X main.version=...".
@@ -139,24 +145,76 @@ func run() error {
 	mux.Handle("DELETE /api/v1/services/{stack}", auth(http.HandlerFunc(services.Delete)))
 	mux.Handle("POST /api/v1/services/register", auth(http.HandlerFunc(services.Register)))
 
+	// Healthcheck sweep. The tick endpoint is authenticated like any
+	// other mutating route: on Lambda the EventBridge rule carries a
+	// bearer token, the same shape sc-component-backup uses for its
+	// own scheduler tick.
+	healthCfg := &api.HealthConfig{
+		Registry:    reg,
+		Prober:      health.NewHTTPProber(time.Duration(envInt("HEALTHCHECK_TIMEOUT_SECONDS", 5)) * time.Second),
+		DefaultPath: envOr("HEALTHCHECK_PATH", "/healthz"),
+		RetainDays:  envInt("HEALTHCHECK_RETAIN_DAYS", 30),
+	}
+	mux.Handle("POST /api/v1/scheduler/healthcheck/tick", auth(http.HandlerFunc(healthCfg.Tick)))
+	mux.Handle("GET /api/v1/services/{stack}/health", auth(http.HandlerFunc(healthCfg.History)))
+
+	// Embedded SPA last, on the catch-all, so it cannot shadow an API
+	// route. A missing dist is a warning rather than a failure: a
+	// Go-only change should not require having run npm, and an operator
+	// debugging the API does not need the UI present.
+	if dist, derr := ui.Dist(); derr != nil {
+		slog.Warn("SPA not embedded — serving API only", "err", derr)
+	} else if _, serr := fs.Stat(dist, "index.html"); serr != nil {
+		slog.Warn("SPA dist present but has no index.html — serving API only", "err", serr)
+	} else {
+		mux.Handle("/", ui.Handler(dist))
+		slog.Info("SPA mounted")
+	}
+
 	port := envOr("PORT", "8080")
 	slog.Info(
 		"starting sc-component-observatory",
 		"version", version, "commit", commit,
 		"storage", location, "metadata", metaType,
 		"operator_password_set", operatorPassword != "",
+		"self_url", os.Getenv("OBSERVATORY_SELF_URL"),
 		"port", port,
 	)
 
-	srv := &http.Server{
-		Addr:              ":" + port,
-		Handler:           withRequestLog(mux),
-		ReadHeaderTimeout: 10 * time.Second,
+	// Bridge through go-aws-lambda-sdk, the fleet pattern. Under Lambda
+	// (AWS_LAMBDA_FUNCTION_NAME set) it joins the Lambda runtime API and
+	// adapts Function URL events onto this vanilla handler; outside
+	// Lambda it falls back to net/http on $PORT. One binary serves both,
+	// so local development and the deployed artifact cannot drift.
+	//
+	// context.Background(), NOT the startup ctx: that one carries a 30s
+	// timeout to bound secret resolution and store construction, and
+	// handing it to the server would kill the process 30s after boot.
+	svc, err := sdkservice.New(context.Background(), sdkservice.WithVanillaHandler(withRequestLog(mux)))
+	if err != nil {
+		return fmt.Errorf("sdkservice init: %w", err)
 	}
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return err
+	if err := svc.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("sdkservice exited: %w", err)
 	}
+	slog.Info("exited cleanly")
 	return nil
+}
+
+// envInt reads an integer env var, falling back on absent or garbage
+// input rather than failing the boot — these are tuning knobs, and a
+// typo in one should not take the dashboard down.
+func envInt(name string, fallback int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		slog.Warn("ignoring unparseable env var", "name", name, "value", v, "using", fallback)
+		return fallback
+	}
+	return n
 }
 
 // buildObjectStore constructs the object store from env and returns a

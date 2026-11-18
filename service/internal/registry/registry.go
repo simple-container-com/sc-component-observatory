@@ -41,6 +41,23 @@ type Store interface {
 	// limit <= 0 means no cap.
 	DeployHistory(ctx context.Context, stack string, limit int) ([]DeployEvent, error)
 
+	// PutHealth records one probe outcome.
+	PutHealth(ctx context.Context, res HealthResult) error
+
+	// HealthHistory returns probe results for one stack, newest first.
+	// limit <= 0 means no cap.
+	HealthHistory(ctx context.Context, stack string, limit int) ([]HealthResult, error)
+
+	// LatestHealth returns the most recent result per region for one
+	// stack. Keyed by region ("" for a single-region service) so the
+	// dashboard can show a per-region status rather than collapsing a
+	// partial outage into one green tick.
+	LatestHealth(ctx context.Context, stack string) (map[string]HealthResult, error)
+
+	// PruneHealth drops results older than `before`. Probe results are
+	// small but accumulate per service per interval forever.
+	PruneHealth(ctx context.Context, before time.Time) (int, error)
+
 	Close(ctx context.Context) error
 }
 
@@ -171,6 +188,20 @@ func Register(ctx context.Context, store Store, incoming ServiceRecord, now time
 		}
 		if rec.Commit == "" {
 			rec.Commit = existing.Commit
+		}
+		// Same preserve-on-empty rule as Sources, for the same reason:
+		// a registration reports what THIS deploy observed, and a
+		// deploy that could not read the client config (or a plugin
+		// version that did not send it) must not erase what a previous
+		// one captured.
+		if len(rec.ClientConfig) == 0 && len(existing.ClientConfig) > 0 {
+			rec.ClientConfig = existing.ClientConfig
+		}
+		if len(rec.Regions) == 0 && len(existing.Regions) > 0 {
+			rec.Regions = existing.Regions
+		}
+		if rec.HealthPath == "" {
+			rec.HealthPath = existing.HealthPath
 		}
 	} else {
 		rec.FirstSeenAt = now

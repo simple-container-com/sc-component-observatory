@@ -114,7 +114,71 @@ type ServiceRecord struct {
 	// a warning badge so a wrong guess is visible instead of silently
 	// returning no logs.
 	Inferred bool `bson:"inferred,omitempty" json:"inferred,omitempty"`
+
+	// Regions the service is deployed into. Health is probed per
+	// region, because a multi-region deploy can be healthy in one and
+	// down in another, and a single aggregate status would hide that.
+	// Empty means single-region / unknown, probed once.
+	Regions []string `bson:"regions,omitempty" json:"regions,omitempty"`
+
+	// HealthPath overrides the component-wide default for this service.
+	// Extracted from the client config at registration when the service
+	// declares its own healthcheck (a compose `healthcheck:` block, an
+	// explicit `healthPath`), because the service knows where its own
+	// probe lives better than a fleet-wide default does.
+	HealthPath string `bson:"healthPath,omitempty" json:"health_path,omitempty"`
+
+	// ClientConfig is the consumer's FULL resolved client config as the
+	// plugin saw it at deploy time, stored verbatim.
+	//
+	// Kept whole rather than cherry-picked because the useful fields
+	// are not knowable in advance: a compose healthcheck, resource
+	// limits, scaling bounds, the schedule list, which `uses:` entries
+	// were declared. Picking fields means re-deploying the component
+	// every time an operator wants to see one more of them. Secrets are
+	// NOT included — the plugin strips them before sending (see
+	// SanitizeClientConfig), because this lands in object storage and
+	// is served to the dashboard.
+	ClientConfig map[string]any `bson:"clientConfig,omitempty" json:"client_config,omitempty"`
 }
+
+// HealthResult is one probe outcome for one service in one region.
+//
+// Stored append-only, like deploy events: a dashboard that only shows
+// current health cannot answer "was it down overnight", which is the
+// question that actually gets asked.
+type HealthResult struct {
+	Stack  string    `bson:"stack" json:"stack"`
+	Region string    `bson:"region,omitempty" json:"region,omitempty"`
+	At     time.Time `bson:"at" json:"at"`
+
+	// Status is one of HealthUp / HealthDown / HealthUnknown.
+	Status string `bson:"status" json:"status"`
+
+	// HTTPStatus is the response code when the probe got one. Zero for
+	// a transport failure, which is a different thing from a 500 and
+	// must stay distinguishable.
+	HTTPStatus int `bson:"httpStatus,omitempty" json:"http_status,omitempty"`
+
+	// LatencyMS is the round trip. Useful on its own as a crude
+	// availability signal before real metrics land.
+	LatencyMS int64 `bson:"latencyMs,omitempty" json:"latency_ms,omitempty"`
+
+	// Error is the transport or protocol failure, truncated. Empty when
+	// the probe succeeded.
+	Error string `bson:"error,omitempty" json:"error,omitempty"`
+
+	// URL actually probed, recorded so a wrong health path is visible
+	// in the UI rather than presenting as a down service.
+	URL string `bson:"url,omitempty" json:"url,omitempty"`
+}
+
+// Health status tokens.
+const (
+	HealthUp      = "up"
+	HealthDown    = "down"
+	HealthUnknown = "unknown"
+)
 
 // DeployEvent is one append-only registration. The dashboard renders
 // these as a per-service timeline — what version landed when, from

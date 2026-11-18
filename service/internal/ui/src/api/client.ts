@@ -1,0 +1,56 @@
+import type { ServiceDetail, ServicesResponse, SessionInfo } from "./types";
+
+/**
+ * Every error path on the Go side returns parseable JSON with an
+ * `error` key — deliberately, because the first SC Component served
+ * HTML 404s to a JSON-expecting SPA and the resulting crash was
+ * unreadable. So this can always try JSON first and still degrade
+ * safely if something upstream (a proxy, a 502 page) does not.
+ */
+export class ApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const res = await fetch(path, {
+    method,
+    credentials: "same-origin",
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    let msg = text || `HTTP ${res.status}`;
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed?.error) msg = parsed.error;
+    } catch {
+      // Not JSON — keep the raw text, truncated so a stray HTML page
+      // cannot flood the UI.
+      msg = text.slice(0, 200) || `HTTP ${res.status}`;
+    }
+    throw new ApiError(res.status, msg);
+  }
+  return (text ? JSON.parse(text) : null) as T;
+}
+
+export const api = {
+  session: () => request<SessionInfo>("GET", "/api/v1/session"),
+  login: (password: string) => request<null>("POST", "/api/v1/login", { password }),
+  logout: () => request<null>("POST", "/api/v1/logout"),
+  services: () => request<ServicesResponse>("GET", "/api/v1/services"),
+  service: (stack: string) =>
+    request<ServiceDetail>("GET", `/api/v1/services/${encodeURIComponent(stack)}`),
+  removeService: (stack: string) =>
+    request<{ deleted: string }>("DELETE", `/api/v1/services/${encodeURIComponent(stack)}`),
+};
+
+export function describeError(e: unknown): string {
+  if (e instanceof ApiError) return e.message;
+  if (e instanceof Error) return e.message;
+  return String(e);
+}

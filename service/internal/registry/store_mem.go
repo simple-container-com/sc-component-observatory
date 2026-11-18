@@ -7,19 +7,22 @@ import (
 	"context"
 	"sort"
 	"sync"
+	"time"
 )
 
 // InMemoryStore is the tests + local-dev Store. No persistence.
 type InMemoryStore struct {
 	mu      sync.RWMutex
 	records map[string]ServiceRecord
-	events  map[string][]DeployEvent // keyed by stack
+	events  map[string][]DeployEvent  // keyed by stack
+	health  map[string][]HealthResult // keyed by stack
 }
 
 func NewInMemoryStore() *InMemoryStore {
 	return &InMemoryStore{
 		records: map[string]ServiceRecord{},
 		events:  map[string][]DeployEvent{},
+		health:  map[string][]HealthResult{},
 	}
 }
 
@@ -53,6 +56,7 @@ func (s *InMemoryStore) Delete(_ context.Context, stack string) error {
 	defer s.mu.Unlock()
 	delete(s.records, stack)
 	delete(s.events, stack)
+	delete(s.health, stack)
 	return nil
 }
 
@@ -95,3 +99,64 @@ func (s *InMemoryStore) DeployHistory(_ context.Context, stack string, limit int
 }
 
 func (s *InMemoryStore) Close(_ context.Context) error { return nil }
+
+func (s *InMemoryStore) PutHealth(_ context.Context, res HealthResult) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.health == nil {
+		s.health = map[string][]HealthResult{}
+	}
+	s.health[res.Stack] = append(s.health[res.Stack], res)
+	return nil
+}
+
+func (s *InMemoryStore) HealthHistory(_ context.Context, stack string, limit int) ([]HealthResult, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	src := s.health[stack]
+	// Reverse-copy then stable-sort so ties on an identical timestamp
+	// resolve to most-recently-recorded first, same reasoning as
+	// DeployHistory.
+	out := make([]HealthResult, 0, len(src))
+	for i := len(src) - 1; i >= 0; i-- {
+		out = append(out, src[i])
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].At.After(out[j].At) })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (s *InMemoryStore) LatestHealth(ctx context.Context, stack string) (map[string]HealthResult, error) {
+	hist, err := s.HealthHistory(ctx, stack, 0)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]HealthResult{}
+	// hist is newest-first, so the first sighting of a region wins.
+	for _, r := range hist {
+		if _, seen := out[r.Region]; !seen {
+			out[r.Region] = r
+		}
+	}
+	return out, nil
+}
+
+func (s *InMemoryStore) PruneHealth(_ context.Context, before time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pruned := 0
+	for stack, results := range s.health {
+		kept := results[:0]
+		for _, r := range results {
+			if r.At.Before(before) {
+				pruned++
+				continue
+			}
+			kept = append(kept, r)
+		}
+		s.health[stack] = kept
+	}
+	return pruned, nil
+}

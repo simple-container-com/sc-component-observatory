@@ -73,6 +73,21 @@ type serviceJSON struct {
 	// "not wired up" — the first Component taught us that silent
 	// degradation costs more than a blunt error.
 	TelemetryReady bool `json:"telemetry_ready"`
+
+	// Health is the worst-wins summary across regions, one of
+	// up/down/unknown, with the timestamp of the newest probe behind
+	// it. Computed server-side so the UI holds no health logic.
+	Health     string `json:"health"`
+	HealthAt   string `json:"health_at"`
+	HealthPath string `json:"health_path"`
+
+	// Regions is never null.
+	Regions []string `json:"regions"`
+
+	// HasClientConfig tells the UI whether a detail view can render the
+	// deploy config, without shipping the whole map in the list
+	// response — the list is the hot path and a compose block is large.
+	HasClientConfig bool `json:"has_client_config"`
 }
 
 type sourceJSON struct {
@@ -116,6 +131,12 @@ func toServiceJSON(r registry.ServiceRecord, now time.Time) serviceJSON {
 		})
 	}
 	out.TelemetryReady = len(out.Sources) > 0
+	out.HealthPath = r.HealthPath
+	out.Regions = make([]string, 0, len(r.Regions))
+	out.Regions = append(out.Regions, r.Regions...)
+	out.HasClientConfig = len(r.ClientConfig) > 0
+	// Health defaults to unknown; List/Get overlay the real summary.
+	out.Health = registry.HealthUnknown
 	return out
 }
 
@@ -134,7 +155,18 @@ func (c *ServicesConfig) List(w http.ResponseWriter, r *http.Request) {
 	now := c.now()
 	out := make([]serviceJSON, 0, len(recs))
 	for _, rec := range recs {
-		out = append(out, toServiceJSON(rec, now))
+		row := toServiceJSON(rec, now)
+		// Health is read per service rather than in one bulk query
+		// because the colocated store has no cross-service index. Bounded
+		// by fleet size (tens), and LatestHealth reads one capped page.
+		if latest, err := c.Registry.LatestHealth(r.Context(), rec.Stack); err == nil {
+			status, at := summarizeHealth(latest)
+			row.Health = status
+			if !at.IsZero() {
+				row.HealthAt = at.UTC().Format(time.RFC3339)
+			}
+		}
+		out = append(out, row)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"count":    len(out),
@@ -173,9 +205,30 @@ func (c *ServicesConfig) Get(w http.ResponseWriter, r *http.Request) {
 	events := make([]registry.DeployEvent, 0, len(hist))
 	events = append(events, hist...)
 
+	svc := toServiceJSON(rec, c.now())
+	latestHealth := map[string]registry.HealthResult{}
+	if latest, herr := c.Registry.LatestHealth(r.Context(), stack); herr == nil {
+		latestHealth = latest
+		status, at := summarizeHealth(latest)
+		svc.Health = status
+		if !at.IsZero() {
+			svc.HealthAt = at.UTC().Format(time.RFC3339)
+		}
+	}
+
+	// client_config is served only on the detail view. Already stripped
+	// of secrets plugin-side before it was ever stored; emitted as an
+	// object (never null) so the UI can iterate it unguarded.
+	clientConfig := rec.ClientConfig
+	if clientConfig == nil {
+		clientConfig = map[string]any{}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"service": toServiceJSON(rec, c.now()),
-		"deploys": events,
+		"service":       svc,
+		"deploys":       events,
+		"health":        latestHealth,
+		"client_config": clientConfig,
 	})
 }
 
@@ -215,14 +268,23 @@ func (c *ServicesConfig) Delete(w http.ResponseWriter, r *http.Request) {
 
 // registerRequest is the plugin's push-register body.
 type registerRequest struct {
-	Stack       string `json:"stack"`
-	Cloud       string `json:"cloud"`
-	Template    string `json:"template"`
-	Version     string `json:"version"`
-	Commit      string `json:"commit"`
-	EndpointURL string `json:"endpoint_url"`
-	Inferred    bool   `json:"inferred"`
-	Sources     []struct {
+	Stack       string   `json:"stack"`
+	Cloud       string   `json:"cloud"`
+	Template    string   `json:"template"`
+	Version     string   `json:"version"`
+	Commit      string   `json:"commit"`
+	EndpointURL string   `json:"endpoint_url"`
+	Inferred    bool     `json:"inferred"`
+	Regions     []string `json:"regions"`
+	HealthPath  string   `json:"health_path"`
+
+	// ClientConfig is the consumer's full resolved client config, minus
+	// secrets. Stored verbatim so a detail view can show what was
+	// actually deployed without the component guessing in advance which
+	// fields an operator will want.
+	ClientConfig map[string]any `json:"client_config"`
+
+	Sources []struct {
 		Kind   string            `json:"kind"`
 		Ref    string            `json:"ref"`
 		Region string            `json:"region"`
@@ -263,14 +325,17 @@ func (c *ServicesConfig) Register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rec := registry.ServiceRecord{
-		Stack:       body.Stack,
-		Cloud:       body.Cloud,
-		Template:    body.Template,
-		Version:     body.Version,
-		Commit:      body.Commit,
-		EndpointURL: body.EndpointURL,
-		Inferred:    body.Inferred,
-		DeployedAt:  c.now(),
+		Stack:        body.Stack,
+		Cloud:        body.Cloud,
+		Template:     body.Template,
+		Version:      body.Version,
+		Commit:       body.Commit,
+		EndpointURL:  body.EndpointURL,
+		Inferred:     body.Inferred,
+		Regions:      body.Regions,
+		HealthPath:   body.HealthPath,
+		ClientConfig: body.ClientConfig,
+		DeployedAt:   c.now(),
 	}
 	for _, s := range body.Sources {
 		rec.Sources = append(rec.Sources, registry.TelemetrySource{
