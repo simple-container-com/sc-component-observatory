@@ -288,7 +288,7 @@ func TestErrorsAreJSON(t *testing.T) {
 	cfg, _ := newCfg()
 	m := mux(cfg)
 	for _, tc := range []struct{ method, path, token string }{
-		{"GET", "/api/v1/services", ""},                                     // 401
+		{"GET", "/api/v1/services", ""},                                      // 401
 		{"GET", "/api/v1/services/nope--staging", jwtFor(t, "operator", "")}, // 404
 	} {
 		rr := do(t, m, tc.method, tc.path, tc.token, nil)

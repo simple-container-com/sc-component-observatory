@@ -112,7 +112,14 @@ type Ingress struct {
 // any S3-compatible gateway via EndpointURL), gcs, filesystem (a PVC,
 // an EFS mount, or a plain VM path).
 type Storage struct {
-	// Type is one of "s3", "gcs", "filesystem". Defaults to "s3".
+	// Type is one of "s3", "filesystem". Defaults to "s3".
+	//
+	// "gcs" is declared in the token list below as the forward-looking
+	// contract but is NOT accepted yet: the GCS backend would pull the
+	// whole google.golang.org/api tree into every build for a path the
+	// AWS-first slices never exercise. Validation rejects it with a
+	// clear message rather than letting an operator write config that
+	// only fails at container boot.
 	Type string `json:"type,omitempty" yaml:"type,omitempty"`
 
 	// Bucket is the S3/GCS bucket. When empty on an s3/gcs deploy the
@@ -209,8 +216,10 @@ func (c *ObservatoryConfig) validateStorage() error {
 		return nil
 	}
 	switch t := c.Storage.Type; t {
-	case "", StorageTypeS3, StorageTypeGCS:
+	case "", StorageTypeS3:
 		// Bucket may be empty — the plugin provisions one.
+	case StorageTypeGCS:
+		return errors.Errorf("`storage.type: gcs` is not implemented in this build of %q yet — use %q (which also serves any S3-compatible gateway via `storage.endpointUrl`) or %q", ResourceType, StorageTypeS3, StorageTypeFilesystem)
 	case StorageTypeFilesystem:
 		if c.Storage.Path == "" {
 			return errors.Errorf("`storage.path` is required when `storage.type: filesystem` for %q — point it at a PVC, an EFS mount, or a VM directory", ResourceType)
@@ -221,7 +230,7 @@ func (c *ObservatoryConfig) validateStorage() error {
 			return errors.Errorf("`storage.type: filesystem` is incompatible with `deployTo: lambda` for %q — Lambda's /tmp is ephemeral and not shared between containers, so the registry would be lost on cold start; use `storage.type: s3`", ResourceType)
 		}
 	default:
-		return errors.Errorf("unknown `storage.type` %q for %q — expected one of %q, %q, %q", t, ResourceType, StorageTypeS3, StorageTypeGCS, StorageTypeFilesystem)
+		return errors.Errorf("unknown `storage.type` %q for %q — expected %q or %q", t, ResourceType, StorageTypeS3, StorageTypeFilesystem)
 	}
 	return nil
 }

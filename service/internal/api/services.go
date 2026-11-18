@@ -285,7 +285,8 @@ func (c *ServicesConfig) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slog.Info("service registered",
+	slog.Info(
+		"service registered",
 		"stack", saved.Stack, "version", saved.Version,
 		"cloud", saved.Cloud, "template", saved.Template,
 		"sources", len(saved.Sources), "inferred", saved.Inferred,

@@ -1,0 +1,250 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) Simple Container
+
+package registry
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"path"
+	"sort"
+	"strings"
+	"sync"
+
+	"github.com/simple-container-com/sc-component-observatory/service/internal/storage"
+)
+
+// ColocatedStore keeps the registry as JSON objects in the same object
+// store that holds everything else, under a `_meta/` prefix.
+//
+// This is the DEFAULT backing store, and the reason an operator can
+// deploy observatory by naming one bucket: there is no second database
+// to provision, no connection string to wire, and no migration to run.
+// The first SC Component shipped assuming Mongo was available and had
+// to be retrofitted; starting colocated avoids that.
+//
+// Layout:
+//
+//	<prefix>/_meta/services/<enc-stack>.json          one ServiceRecord
+//	<prefix>/_meta/deploys/<enc-stack>/<event-id>.json one DeployEvent
+//
+// Stack names contain "--" and could contain "/" on a non-fleet naming
+// scheme, so keys are escaped rather than interpolated raw.
+//
+// Scale note: List does one LIST + one GET per service. That is fine
+// for the fleet-sized deployments this targets (tens of services) and
+// is why the interface keeps room for database-backed impls — an
+// operator with thousands of services should point `metadata` at a
+// real database instead.
+type ColocatedStore struct {
+	objects storage.Store
+	prefix  string
+
+	// listCache guards against the N+1 GETs being issued concurrently
+	// by several dashboard requests at once. Not a correctness device —
+	// just a cheap way to avoid stampeding the object store on a
+	// refresh-happy browser.
+	mu sync.Mutex
+}
+
+// NewColocatedStore wraps an object store. `prefix` may be empty.
+func NewColocatedStore(objects storage.Store, prefix string) *ColocatedStore {
+	return &ColocatedStore{objects: objects, prefix: strings.Trim(prefix, "/")}
+}
+
+const (
+	metaRoot     = "_meta"
+	servicesDir  = "services"
+	deploysDir   = "deploys"
+	jsonFileExt  = ".json"
+	maxEventScan = 500
+)
+
+// encodeStack makes a stack name safe for one path segment. Only
+// characters that would change the key's shape are escaped, so the
+// common case stays human-readable in a bucket listing — worth a lot
+// when debugging from the AWS console.
+func encodeStack(stack string) string {
+	var b strings.Builder
+	for _, r := range stack {
+		switch {
+		case r == '/' || r == '\\':
+			fmt.Fprintf(&b, "~%02x", r)
+		case r == '~':
+			b.WriteString("~7e")
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func (s *ColocatedStore) key(parts ...string) string {
+	all := make([]string, 0, len(parts)+2)
+	if s.prefix != "" {
+		all = append(all, s.prefix)
+	}
+	all = append(all, metaRoot)
+	all = append(all, parts...)
+	return path.Join(all...)
+}
+
+func (s *ColocatedStore) serviceKey(stack string) string {
+	return s.key(servicesDir, encodeStack(stack)+jsonFileExt)
+}
+
+func (s *ColocatedStore) deployPrefix(stack string) string {
+	return s.key(deploysDir, encodeStack(stack)) + "/"
+}
+
+// putJSON marshals and writes. Uses a bytes.Reader so the object store
+// can declare Content-Length — the streaming path exists for unknown
+// length bodies and S3 PutObject rejects those with HTTP 411.
+func (s *ColocatedStore) putJSON(ctx context.Context, key string, v any) error {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Errorf("marshal %s: %w", key, err)
+	}
+	if _, err := s.objects.Put(ctx, key, bytes.NewReader(raw)); err != nil {
+		return fmt.Errorf("put %s: %w", key, err)
+	}
+	return nil
+}
+
+// getJSON reads and unmarshals. found=false when the object is absent,
+// which must be distinguishable from a backend failure: a missing
+// service is a 404, a broken bucket is a 500.
+func (s *ColocatedStore) getJSON(ctx context.Context, key string, out any) (bool, error) {
+	rc, err := s.objects.Get(ctx, key)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get %s: %w", key, err)
+	}
+	defer rc.Close()
+	raw, err := io.ReadAll(rc)
+	if err != nil {
+		return false, fmt.Errorf("read %s: %w", key, err)
+	}
+	if err := json.Unmarshal(raw, out); err != nil {
+		// A corrupt object should not take down the whole listing;
+		// callers that can skip it do.
+		return false, fmt.Errorf("unmarshal %s: %w", key, err)
+	}
+	return true, nil
+}
+
+func (s *ColocatedStore) Get(ctx context.Context, stack string) (ServiceRecord, bool, error) {
+	var rec ServiceRecord
+	found, err := s.getJSON(ctx, s.serviceKey(stack), &rec)
+	if err != nil {
+		return ServiceRecord{}, false, err
+	}
+	return rec, found, nil
+}
+
+func (s *ColocatedStore) List(ctx context.Context) ([]ServiceRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	objs, err := s.objects.List(ctx, s.key(servicesDir)+"/")
+	if err != nil {
+		return nil, fmt.Errorf("list services: %w", err)
+	}
+	out := make([]ServiceRecord, 0, len(objs))
+	for _, o := range objs {
+		if !strings.HasSuffix(o.Path, jsonFileExt) {
+			continue
+		}
+		var rec ServiceRecord
+		found, err := s.getJSON(ctx, o.Path, &rec)
+		if err != nil || !found {
+			// Skip an unreadable record rather than failing the whole
+			// dashboard. One corrupt object must not blank the page.
+			continue
+		}
+		out = append(out, rec)
+	}
+	SortRecords(out)
+	return out, nil
+}
+
+func (s *ColocatedStore) Put(ctx context.Context, rec ServiceRecord) error {
+	return s.putJSON(ctx, s.serviceKey(rec.Stack), rec)
+}
+
+// Delete removes the record and its whole deploy history.
+//
+// Idempotent, and deliberately best-effort on the history objects: the
+// operator's intent is "be rid of this service", so a single failed
+// event delete must not leave the record itself behind and make them
+// run it again.
+func (s *ColocatedStore) Delete(ctx context.Context, stack string) error {
+	events, err := s.objects.List(ctx, s.deployPrefix(stack))
+	if err == nil {
+		for _, o := range events {
+			_ = s.objects.Delete(ctx, o.Path)
+		}
+	}
+	if err := s.objects.Delete(ctx, s.serviceKey(stack)); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("delete service %s: %w", stack, err)
+	}
+	return nil
+}
+
+// AppendDeployEvent writes one event keyed by its id, which makes the
+// write naturally idempotent: a retried registration overwrites its own
+// object instead of adding a duplicate.
+func (s *ColocatedStore) AppendDeployEvent(ctx context.Context, ev DeployEvent) error {
+	if ev.ID == "" {
+		return errors.New("deploy event has no ID")
+	}
+	return s.putJSON(ctx, s.deployPrefix(ev.Stack)+ev.ID+jsonFileExt, ev)
+}
+
+func (s *ColocatedStore) DeployHistory(ctx context.Context, stack string, limit int) ([]DeployEvent, error) {
+	objs, err := s.objects.List(ctx, s.deployPrefix(stack))
+	if err != nil {
+		return nil, fmt.Errorf("list deploys: %w", err)
+	}
+	// Cap the fan-out: a long-lived service accumulates one object per
+	// deploy forever, and the dashboard only ever renders a page.
+	if len(objs) > maxEventScan {
+		sort.Slice(objs, func(i, j int) bool { return objs[i].ModifiedAt.After(objs[j].ModifiedAt) })
+		objs = objs[:maxEventScan]
+	}
+	out := make([]DeployEvent, 0, len(objs))
+	for _, o := range objs {
+		if !strings.HasSuffix(o.Path, jsonFileExt) {
+			continue
+		}
+		var ev DeployEvent
+		found, err := s.getJSON(ctx, o.Path, &ev)
+		if err != nil || !found {
+			continue
+		}
+		out = append(out, ev)
+	}
+	// Newest first, with the event id as a deterministic tiebreak for
+	// events sharing a timestamp (see DeployEventID).
+	sort.SliceStable(out, func(i, j int) bool {
+		if !out[i].DeployedAt.Equal(out[j].DeployedAt) {
+			return out[i].DeployedAt.After(out[j].DeployedAt)
+		}
+		return out[i].ID > out[j].ID
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (s *ColocatedStore) Close(_ context.Context) error { return nil }
