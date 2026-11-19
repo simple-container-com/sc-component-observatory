@@ -8,7 +8,7 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/pkg/errors v0.9.1
 	github.com/pulumi/pulumi/sdk/v3 v3.245.0
-	github.com/simple-container-com/api v0.0.0-20261119062606-d5d5540f46a9
+	github.com/simple-container-com/api v0.0.0-20261119091249-49facf7520b2
 )
 
 require (

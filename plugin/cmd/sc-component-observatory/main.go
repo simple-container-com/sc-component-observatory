@@ -380,6 +380,11 @@ func (p *observatoryPlugin) ComputeProcess(stdctx context.Context, req *scplugin
 	processor := observatory.NewProcessor(observatory.ProcessorConfig{
 		Progress:     p.progress,
 		ClientConfig: clientCfg,
+		// Deploy identity off the bus header (api#640): the version the
+		// CI action computed, the full commit SHA, and the repository.
+		// Zero value against an older core, which is the pre-#640
+		// behaviour — version then comes from the health probe.
+		DeployIdentity: runtime.DeployIdentityFromHeader(req.GetHeader()),
 	})
 
 	// WithIncomingEnvVars seeds the collector from the shared compute

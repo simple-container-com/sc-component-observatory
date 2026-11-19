@@ -190,6 +190,9 @@ func Register(ctx context.Context, store Store, incoming ServiceRecord, now time
 		if rec.Commit == "" {
 			rec.Commit = existing.Commit
 		}
+		if rec.Repository == "" {
+			rec.Repository = existing.Repository
+		}
 		// Same preserve-on-empty rule as Sources, for the same reason:
 		// a registration reports what THIS deploy observed, and a
 		// deploy that could not read the client config (or a plugin

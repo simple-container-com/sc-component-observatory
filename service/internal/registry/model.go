@@ -80,11 +80,24 @@ type ServiceRecord struct {
 	// is a bug, not a normal reading.
 	Version string `bson:"version" json:"version"`
 
-	// Commit is the full git SHA. NOT auto-injected by SC — the deploy
-	// action exports GITHUB_SHA and services declare it under
-	// `image.build.args`. When absent, CommitFromVersion derives the
-	// short SHA out of Version instead.
+	// Commit is the full git SHA, carried on the plugin bus since
+	// api#640 (RequestHeader.deploy_commit, resolved from $GITHUB_SHA or
+	// the local worktree).
+	//
+	// Before that it was only available when a service declared
+	// GITHUB_SHA under `image.build.args` and routed it through the
+	// compute context, because SC auto-injects VERSION and nothing else.
+	// That fallback still applies against an older core. When absent
+	// entirely, ShortCommit derives the short SHA out of Version.
 	Commit string `bson:"commit,omitempty" json:"commit,omitempty"`
+
+	// Repository is `<owner>/<repo>`, so the dashboard can link a
+	// deployed service back to its source.
+	//
+	// Only knowable from the bus (api#640): it appears in no resource
+	// config and in no env a sibling contributes. Empty against an
+	// older core.
+	Repository string `bson:"repository,omitempty" json:"repository,omitempty"`
 
 	// DeployedAt is when this version registered. OBSERVED by
 	// observatory at ComputeProcess time, never self-reported, so a
