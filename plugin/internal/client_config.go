@@ -147,35 +147,20 @@ func HealthPathFromClientConfig(cfg map[string]any) string {
 	if cfg == nil {
 		return ""
 	}
-	if p, ok := cfg["healthPath"].(string); ok && p != "" {
+	// Searched the same nested way as the endpoint URL, and for the same
+	// reason: the descriptor is wrapped, so a top-level lookup finds
+	// nothing. See findStringDeep.
+	if p := findStringDeep(cfg, "healthPath"); p != "" {
 		return normalizePath(p)
 	}
-	if hc, ok := cfg["healthcheck"].(map[string]any); ok {
+	// A compose stack nests healthchecks per service; findMapDeep takes
+	// the shallowest `healthcheck` block, whichever level it sits at.
+	if hc := findMapDeep(cfg, "healthcheck"); hc != nil {
 		if p, ok := hc["path"].(string); ok && p != "" {
 			return normalizePath(p)
 		}
 		if p := pathFromComposeTest(hc["test"]); p != "" {
 			return p
-		}
-	}
-	// A compose stack nests healthchecks per service; take the first
-	// one that declares an HTTP probe.
-	if svcs, ok := cfg["services"].(map[string]any); ok {
-		for _, raw := range svcs {
-			svc, ok := raw.(map[string]any)
-			if !ok {
-				continue
-			}
-			hc, ok := svc["healthcheck"].(map[string]any)
-			if !ok {
-				continue
-			}
-			if p, ok := hc["path"].(string); ok && p != "" {
-				return normalizePath(p)
-			}
-			if p := pathFromComposeTest(hc["test"]); p != "" {
-				return p
-			}
 		}
 	}
 	return ""
@@ -254,33 +239,116 @@ func normalizePath(p string) string {
 // `unknown` rather than `down`: a service with no published endpoint is
 // a wiring gap, not an outage, and the two must stay distinguishable.
 func EndpointURLFromClientConfig(cfg map[string]any) string {
-	if cfg == nil {
-		return ""
-	}
-	if u := firstStringKey(cfg, "endpointUrl", "publicUrl", "domain"); u != "" {
+	if u := findStringDeep(cfg, "endpointUrl", "publicUrl", "domain"); u != "" {
 		return normalizeBaseURL(u)
 	}
-	if svcs, ok := cfg["services"].(map[string]any); ok {
-		for _, raw := range svcs {
-			svc, ok := raw.(map[string]any)
-			if !ok {
-				continue
+	return ""
+}
+
+// maxDescriptorDepth bounds the nested search below.
+//
+// The descriptor's own nesting is two levels (`Config` → `config`), and
+// a compose stack adds two more (`services` → `<name>`). Four covers
+// every real shape with one to spare, while keeping the search from
+// wandering into an arbitrarily deep env or policy blob where a `domain`
+// key would mean something else entirely.
+const maxDescriptorDepth = 4
+
+// findStringDeep returns the first non-empty string value under any of
+// `keys`, searching breadth-first from the top of the descriptor.
+//
+// Why a search rather than a known path: the client descriptor is
+// WRAPPED. api packs `stack.Client.Stacks[env]`, so what arrives is
+//
+//	{"Config": {"config": {"domain": "storage.simple-forge.com", …}},
+//	 "template": "lambda", "type": "single-image"}
+//
+// — the operator's `domain` sits two levels down, under a capitalized
+// outer key (an embedded Go field with no json tag) and a lowercase
+// inner one. A top-level-only lookup finds nothing, which is exactly
+// how the second attempt at this failed: the fix shipped, the plugin
+// ran, and `endpoint_url` was still "" (forge-storage deploy
+// 44479820610).
+//
+// Hard-coding "Config.config.domain" would work today and break the
+// moment api renames a field or adds a level — in silence, since a
+// missing endpoint is indistinguishable from a service that declares
+// none. Breadth-first with a depth bound is shape-independent, and
+// BREADTH-first specifically: the shallowest match wins, so the
+// operator's own `domain` is preferred over any deeper key that happens
+// to share the name.
+func findStringDeep(root map[string]any, keys ...string) string {
+	if root == nil {
+		return ""
+	}
+	type level struct {
+		m     map[string]any
+		depth int
+	}
+	queue := []level{{m: root, depth: 0}}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+
+		for _, k := range keys {
+			if v, ok := cur.m[k].(string); ok && strings.TrimSpace(v) != "" {
+				return strings.TrimSpace(v)
 			}
-			if u := firstStringKey(svc, "endpointUrl", "publicUrl", "domain"); u != "" {
-				return normalizeBaseURL(u)
+		}
+		if cur.depth >= maxDescriptorDepth {
+			continue
+		}
+		for _, v := range cur.m {
+			switch t := v.(type) {
+			case map[string]any:
+				queue = append(queue, level{m: t, depth: cur.depth + 1})
+			case []any:
+				for _, item := range t {
+					if m, ok := item.(map[string]any); ok {
+						queue = append(queue, level{m: m, depth: cur.depth + 1})
+					}
+				}
 			}
 		}
 	}
 	return ""
 }
 
-func firstStringKey(m map[string]any, keys ...string) string {
-	for _, k := range keys {
-		if v, ok := m[k].(string); ok && strings.TrimSpace(v) != "" {
-			return strings.TrimSpace(v)
+// findMapDeep is findStringDeep for a nested map value — used to locate
+// a `healthcheck` block wherever the descriptor keeps it.
+func findMapDeep(root map[string]any, key string) map[string]any {
+	if root == nil {
+		return nil
+	}
+	type level struct {
+		m     map[string]any
+		depth int
+	}
+	queue := []level{{m: root, depth: 0}}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+
+		if v, ok := cur.m[key].(map[string]any); ok && len(v) > 0 {
+			return v
+		}
+		if cur.depth >= maxDescriptorDepth {
+			continue
+		}
+		for _, v := range cur.m {
+			switch t := v.(type) {
+			case map[string]any:
+				queue = append(queue, level{m: t, depth: cur.depth + 1})
+			case []any:
+				for _, item := range t {
+					if m, ok := item.(map[string]any); ok {
+						queue = append(queue, level{m: m, depth: cur.depth + 1})
+					}
+				}
+			}
 		}
 	}
-	return ""
+	return nil
 }
 
 // normalizeBaseURL turns a bare hostname into an https base and strips
