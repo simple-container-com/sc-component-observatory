@@ -62,7 +62,61 @@ func NewHTTPProber(timeout time.Duration) *HTTPProber {
 	}
 }
 
+// Probe makes one reading, retrying ONCE on a transport failure.
+//
+// A serverless cold start is not an outage. A container-image Lambda
+// that has just been deployed — or has simply been idle — can take
+// several seconds to answer its first request, which the 5s default
+// timeout records as DOWN. That lands at the worst possible moment:
+// immediately after a deploy, which is exactly when an operator is
+// looking at the dashboard. Live-caught 2026-11-19 on the first tenant:
+// `status: down, latency_ms: 5000` seconds after a successful deploy,
+// while curl against the same URL answered 200 in 0.56s, and the next
+// sweep read 58ms.
+//
+// So a transport failure gets one retry. The first attempt is what
+// warms the target; the second is the reading. An HTTP STATUS is never
+// retried — the service answered, and a 500 twice is the same 500.
+//
+// The cost is bounded: one extra request per genuinely-down service per
+// sweep. The alternative — simply raising the timeout — would make
+// every sweep wait longer on real outages without ever distinguishing
+// "slow to wake" from "not there".
 func (p *HTTPProber) Probe(ctx context.Context, url string) registry.HealthResult {
+	res := p.probeOnce(ctx, url)
+	if res.Status != registry.HealthDown || res.HTTPStatus != 0 {
+		// Either healthy, or the service answered with a status code.
+		return res
+	}
+	// Transport failure. Give the target a moment to finish waking,
+	// then take the real reading.
+	select {
+	case <-ctx.Done():
+		return res
+	case <-time.After(coldStartGrace):
+	}
+	retry := p.probeOnce(ctx, url)
+	retry.Retried = true
+	if retry.Status == registry.HealthUp {
+		return retry
+	}
+	// Still down. Keep the retry's reading but carry both errors, so a
+	// log shows it was tried twice rather than looking like one flaky
+	// probe.
+	if retry.Error != "" && res.Error != "" && retry.Error != res.Error {
+		retry.Error = truncate(res.Error+" (retry: "+retry.Error+")", 300)
+	}
+	return retry
+}
+
+// coldStartGrace is the pause before the retry.
+//
+// Short on purpose: it is a yield, not a backoff. The first attempt
+// already spent the full timeout, which is most of what a cold start
+// needs; this just avoids hammering the same instant.
+const coldStartGrace = 500 * time.Millisecond
+
+func (p *HTTPProber) probeOnce(ctx context.Context, url string) registry.HealthResult {
 	res := registry.HealthResult{URL: url, At: time.Now().UTC()}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
