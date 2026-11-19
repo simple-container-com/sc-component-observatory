@@ -50,6 +50,9 @@ type serviceJSON struct {
 	Version     string `json:"version"`
 	Commit      string `json:"commit"`
 	ShortCommit string `json:"short_commit"`
+	// Repository is `<owner>/<repo>` when the bus carried it, so the UI
+	// can link back to source. Empty is normal against an older SC core.
+	Repository string `json:"repository,omitempty"`
 
 	// VersionSource says where Version came from, so the dashboard can
 	// label it rather than presenting two different facts identically:
@@ -126,6 +129,7 @@ func toServiceJSON(r registry.ServiceRecord, now time.Time) serviceJSON {
 		Version:     r.Version,
 		Commit:      r.Commit,
 		ShortCommit: r.ShortCommit(),
+		Repository:  r.Repository,
 		EndpointURL: r.EndpointURL,
 		Sources:     make([]sourceJSON, 0, len(r.Sources)),
 		Inferred:    r.Inferred,

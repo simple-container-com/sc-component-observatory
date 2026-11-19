@@ -21,6 +21,7 @@ import (
 	"github.com/simple-container-com/api/pkg/api"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 	scPlugin "github.com/simple-container-com/api/pkg/plugin"
+	"github.com/simple-container-com/api/pkg/plugin/runtime"
 )
 
 // Push-register retry policy. Matches sc-component-backup's, which
@@ -54,6 +55,20 @@ type ProcessorConfig struct {
 	// to recording deploy facts without the consumer's config, which is
 	// the pre-api#639 behaviour.
 	ClientConfig map[string]any
+
+	// DeployIdentity is what the bus says about the code being deployed:
+	// version, full commit SHA, `<owner>/<repo>` (api#640).
+	//
+	// Separate from ClientConfig because it describes THIS deploy rather
+	// than the consumer's declared configuration, and because every
+	// field is independently best-effort — `sc provision` has no deploy
+	// version, a deploy outside a git worktree has no SHA. Empty means
+	// NOT KNOWN and must never be recorded as a value.
+	//
+	// Zero value against an older SC core, which is the pre-api#640
+	// behaviour: version falls back to the health probe and commit to
+	// whatever the CalVer string's trailing segment yields.
+	DeployIdentity runtime.DeployIdentity
 }
 
 // Processor is the ComputeProcessor for a `uses: [my-observatory]`
@@ -76,6 +91,7 @@ type ServiceRecord struct {
 	Template    string            `json:"template"`
 	Version     string            `json:"version"`
 	Commit      string            `json:"commit,omitempty"`
+	Repository  string            `json:"repository,omitempty"`
 	EndpointURL string            `json:"endpoint_url,omitempty"`
 	Inferred    bool              `json:"inferred,omitempty"`
 	Sources     []TelemetrySource `json:"sources,omitempty"`
@@ -164,8 +180,11 @@ func (p *Processor) buildRecord(stackName string, input api.ResourceInput, colle
 		Stack:    stackName,
 		Template: template,
 		Version:  p.deriveVersion(input, collector),
-		Commit:   envFromCollector(collector, "GITHUB_SHA", "COMMIT", "REVISION"),
+		Commit:   p.deriveCommit(collector),
 	}
+	// Repository is only knowable from the bus — it appears in no
+	// resource config and in no env a sibling contributes.
+	rec.Repository = p.cfg.DeployIdentity.Repository
 	if cloud, ok := CloudForTemplate(template); ok {
 		rec.Cloud = cloud
 	}
@@ -249,7 +268,24 @@ func envFromCollector(collector pApi.ComputeContextCollector, names ...string) s
 	return ""
 }
 
+// deriveVersion resolves the deploy version, most authoritative first.
+//
+//  1. The bus header (api#640). This is the value the CI action passed
+//     as `--deploy-version`, carried verbatim.
+//  2. `VERSION` from a preceding `uses:` sibling, for a consumer that
+//     routes it through the compute context itself.
+//  3. `StackParams.Version`, which api#640 also fills from the header —
+//     kept because an in-tree dispatch populates it directly.
+//
+// Returns "" when none resolve, and the SERVICE then falls back to what
+// the deployed process reports on its own health endpoint. That is the
+// honest ordering: a deploy-time version says what SC deployed, a
+// probe-time one says what is running, and the service labels which it
+// is showing rather than silently blending them.
 func (p *Processor) deriveVersion(input api.ResourceInput, collector pApi.ComputeContextCollector) string {
+	if v := p.cfg.DeployIdentity.Version; v != "" {
+		return v
+	}
 	if v := envFromCollector(collector, "VERSION"); v != "" {
 		return v
 	}
@@ -257,6 +293,19 @@ func (p *Processor) deriveVersion(input api.ResourceInput, collector pApi.Comput
 		return input.StackParams.Version
 	}
 	return ""
+}
+
+// deriveCommit resolves the full commit SHA, bus first.
+//
+// The env fallback stays because it is what worked before api#640: a
+// service that declares GITHUB_SHA under `image.build.args` routes it
+// through the compute context. SC auto-injects only VERSION, so that
+// opt-in is the only pre-#640 source.
+func (p *Processor) deriveCommit(collector pApi.ComputeContextCollector) string {
+	if c := p.cfg.DeployIdentity.Commit; c != "" {
+		return c
+	}
+	return envFromCollector(collector, "GITHUB_SHA", "COMMIT", "REVISION")
 }
 
 func (p *Processor) deriveTemplate(input api.ResourceInput) string {

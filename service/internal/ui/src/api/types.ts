@@ -35,6 +35,11 @@ export interface Service {
   version_source?: "deploy" | "probe" | "";
   /** Always the probe-reported value, when there is one. */
   live_version?: string;
+  /**
+   * `<owner>/<repo>`, when the plugin bus carried it (api#640).
+   * Empty against an older SC core, so every use must be conditional.
+   */
+  repository?: string;
   deployed_at: string;
   first_seen_at: string;
   last_seen_at: string;

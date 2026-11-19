@@ -48,7 +48,21 @@ export function ServiceDetailPage() {
       <div className="card p-4">
         <h2 className="text-sm font-medium">Current deploy</h2>
         <dl className="mt-3 grid grid-cols-2 gap-3 text-sm md:grid-cols-4">
-          <Fact label="Version" value={s.version || "—"} mono />
+          <Fact
+            label="Version"
+            value={s.version || "—"}
+            mono
+            /* Say WHICH version this is. A deploy-time value and a
+               probe-time one look identical, and their disagreeing is
+               the interesting case. */
+            title={
+              s.version_source === "probe"
+                ? `${s.version} — reported by the service itself (no version was recorded at deploy)`
+                : s.live_version && s.live_version !== s.version
+                  ? `Deployed ${s.version}, but the service reports ${s.live_version}. The deploy may not have replaced the running code.`
+                  : s.version
+            }
+          />
           <Fact label="Commit" value={s.short_commit || "—"} mono title={s.commit} />
           <Fact label="Deployed" value={relTime(s.deployed_at)} title={exact(s.deployed_at)} />
           <Fact label="First seen" value={relTime(s.first_seen_at)} title={exact(s.first_seen_at)} />
@@ -56,6 +70,10 @@ export function ServiceDetailPage() {
           <Fact label="Template" value={s.template || "—"} />
           <Fact label="Health path" value={s.health_path || "/healthz"} mono />
           <Fact label="Regions" value={s.regions.length ? s.regions.join(", ") : "—"} />
+          {/* Only rendered when the bus carried it (api#640); absent
+              against an older SC core, where a dash would read as "no
+              repository" rather than "not known". */}
+          {s.repository && <Fact label="Repository" value={s.repository} mono />}
         </dl>
         {s.endpoint_url && (
           <a
