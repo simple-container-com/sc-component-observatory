@@ -68,11 +68,58 @@ my-observatory:
     image: simplecontainer/sc-component-observatory:v2026.11.xx
     ingress:
       hostname: observatory.example.com
-    storage:
-      bucket: observatory--staging
+    storage: observatory-data          # name of another SC resource
     signingKey:       "${secret:observatory-signing-key}"
     operatorPassword: "${secret:observatory-operator-password}"
+    schedulerToken:   "${secret:observatory-scheduler-token}"
+    # REQUIRED, and the one block that is not derivable. Without it
+    # nothing ever probes: the service runs the sweep inline when its
+    # tick endpoint is called and nothing calls it on its own, and a
+    # Lambda cannot hold a ticker. Retention rides the same tick.
+    #
+    # It lives here rather than in the component's defaults because SC
+    # resolves `${secret:NAME}` inside a schedule request but not the
+    # `${resource:...}` form, and a generic component cannot hardcode
+    # one stack's secret name. Paste as-is; only the secret name and the
+    # interval are yours to change.
+    cloudExtras:
+      lambdaSchedules:
+        - name: hc-tick                # <= 14 chars, rejected at APPLY
+          expression: "rate(5 minutes)"
+          request: |-
+            {
+              "requestId": "scheduled-healthcheck",
+              "httpMethod": "POST",
+              "path": "/api/v1/scheduler/healthcheck/tick",
+              "requestContext": {
+                "http": {
+                  "path": "/api/v1/scheduler/healthcheck/tick",
+                  "method": "POST",
+                  "protocol": "HTTP/1.1"
+                }
+              },
+              "body": "{}",
+              "headers": {
+                "Authorization": "Bearer ${secret:observatory-scheduler-token}"
+              }
+            }
 ```
+
+`schedulerToken` is an HS256 JWT signed with `signingKey`, carrying
+`{"op":"scheduler"}`. The tick requires that op, so the credential sitting in the
+EventBridge rule's input — readable by anyone with `events:DescribeRule` in the account —
+can fire a sweep and nothing else: no registry read, no tenant registration, no other
+route. Mint it once:
+
+```python
+jwt.encode({"op": "scheduler", "sub": "eventbridge-healthcheck",
+            "iat": now, "nbf": now, "exp": now + 10*365*24*3600},
+           signing_key, algorithm="HS256")
+```
+
+Long-lived on purpose: an EventBridge rule input has no rotation hook, so a short expiry
+stops the sweep and presents as "the dashboard went stale" rather than as an auth error
+anyone would look for. The `op` bound is what limits the damage instead.
 
 Consumers opt in with one line. It must be **last** in `uses:` — telemetry discovery only
 sees what preceding entries published:
