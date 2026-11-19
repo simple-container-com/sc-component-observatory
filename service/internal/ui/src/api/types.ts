@@ -21,6 +21,20 @@ export interface Service {
   version: string;
   commit: string;
   short_commit: string;
+  /**
+   * Where `version` came from. The two can disagree, and that
+   * disagreement is the interesting case: it means a deploy did not
+   * replace the running code.
+   *
+   * "deploy" — recorded at registration; what SC deployed.
+   * "probe"  — read from the service's own health response; what is
+   *            actually running. This is the common case today,
+   *            because the plugin bus carries no version field.
+   * ""       — unknown.
+   */
+  version_source?: "deploy" | "probe" | "";
+  /** Always the probe-reported value, when there is one. */
+  live_version?: string;
   deployed_at: string;
   first_seen_at: string;
   last_seen_at: string;

@@ -184,6 +184,16 @@ type HealthResult struct {
 	Version string `bson:"version,omitempty" json:"version,omitempty"`
 	Commit  string `bson:"commit,omitempty" json:"commit,omitempty"`
 
+	// Retried records that the first attempt failed at the transport
+	// level and this is the second reading.
+	//
+	// Kept because it changes how the latency should be read — a
+	// retried probe's number is the warm request, not what a user's
+	// first hit would see — and because a service that is retried on
+	// every sweep is telling you something (an idle Lambda, a cold
+	// container) even while reporting `up`.
+	Retried bool `bson:"retried,omitempty" json:"retried,omitempty"`
+
 	// URL actually probed, recorded so a wrong health path is visible
 	// in the UI rather than presenting as a down service.
 	URL string `bson:"url,omitempty" json:"url,omitempty"`

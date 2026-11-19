@@ -2,7 +2,31 @@ import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { ChevronRight, RefreshCw } from "lucide-react";
 import { api, describeError } from "@/api/client";
+import type { Service } from "@/api/types";
 import { Empty, ErrorBox, HealthBadge, Pill, Spinner, exact, relTime } from "@/components/bits";
+
+/**
+ * versionTitle spells out which version is being shown and where it
+ * came from.
+ *
+ * The column has room for one string, and "2026.11.19-abc1234" looks
+ * identical whether SC recorded it at deploy time or the service
+ * reported it about itself a minute ago. Those are different facts, and
+ * the hover is where the difference fits.
+ */
+function versionTitle(s: Service): string {
+  if (!s.version) return "No version recorded";
+  if (s.version_source === "probe") {
+    return `${s.version} — reported by the service itself (no version was recorded at deploy)`;
+  }
+  if (s.version_source === "deploy") {
+    if (s.live_version && s.live_version !== s.version) {
+      return `Deployed ${s.version}, but the service reports ${s.live_version}. The deploy may not have replaced the running code.`;
+    }
+    return `${s.version} — recorded at deploy`;
+  }
+  return s.version;
+}
 
 export function ServicesPage() {
   const q = useQuery({
@@ -66,9 +90,19 @@ export function ServicesPage() {
 
                 <HealthBadge status={s.health} title={s.health_at ? `Last probe ${exact(s.health_at)}` : "Never probed"} />
 
-                <span className="truncate font-mono text-xs" title={s.version}>
+                <span className="truncate font-mono text-xs" title={versionTitle(s)}>
                   {s.version || "—"}
                   {s.short_commit && <span className="ml-1 text-faint">{s.short_commit}</span>}
+                  {/* Flag a version the service reported about itself
+                      rather than one recorded at deploy, and flag the
+                      two disagreeing — which means the deploy did not
+                      replace the running code. */}
+                  {s.version_source === "probe" && <span className="ml-1 text-faint">live</span>}
+                  {s.version_source === "deploy" && s.live_version && s.live_version !== s.version && (
+                    <Pill tone="warn" title={`Deployed ${s.version}, but the service reports ${s.live_version} — the deploy may not have replaced the running code`}>
+                      drift
+                    </Pill>
+                  )}
                 </span>
 
                 <span className="text-xs text-muted tnum" title={exact(s.deployed_at)}>
