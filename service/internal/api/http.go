@@ -44,8 +44,16 @@ type claimsKey struct{}
 // Claims is the JWT shape both the plugin (minting registration
 // tokens) and the operator login flow produce.
 type Claims struct {
-	// Op is the token's purpose: "register" for a plugin push-register,
-	// "operator" for a logged-in human.
+	// Op is the token's purpose:
+	//
+	//	"register"  a plugin push-registering one tenant
+	//	"operator"  a logged-in human
+	//	"scheduler" the deploy template's own timer, firing the sweep
+	//
+	// Checked per route, not just for validity. Every tenant's plugin
+	// holds a "register" token, so a route that accepted any valid
+	// token would let any consumer stack drive the whole fleet's
+	// healthcheck sweep.
 	Op string `json:"op"`
 
 	// Tenant scopes a registration token to exactly one stack.
@@ -111,3 +119,13 @@ func ClaimsFromContext(ctx context.Context) *Claims {
 	}
 	return nil
 }
+
+// Token purposes. Constants rather than literals because they are
+// compared in two repos — the service checks them, the plugin mints
+// them — and a typo on either side fails as a 401 with nothing naming
+// the mismatch.
+const (
+	OpRegister  = "register"
+	OpOperator  = "operator"
+	OpScheduler = "scheduler"
+)

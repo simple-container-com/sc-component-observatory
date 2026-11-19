@@ -329,7 +329,7 @@ func (c *ServicesConfig) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	claims := ClaimsFromContext(r.Context())
-	if claims == nil || claims.Op != "register" {
+	if claims == nil || claims.Op != OpRegister {
 		writeErr(w, http.StatusForbidden, "token op must be 'register'")
 		return
 	}
