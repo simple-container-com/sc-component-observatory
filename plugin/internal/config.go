@@ -166,3 +166,78 @@ func DefaultBucketName(resourceName, env string) string {
 	}
 	return strings.Trim(name, "-")
 }
+
+// BucketForStorageRef resolves the operator's `storage:` declaration to
+// the physical bucket the deployed service should read and write.
+//
+// The operator's side of the contract is one word — the NAME of another
+// SC resource declared in the same server.yaml:
+//
+//	sc-observatory-data:
+//	  type: s3-bucket
+//	  config: { credentials: "${auth:aws}", allowOnlyHttps: true }
+//
+//	my-observatory:
+//	  type: sc-observatory
+//	  config: { storage: sc-observatory-data, ... }
+//
+// No bucket name, no region, no credential. That indirection is the
+// point: repointing storage at a different resource — a volume, a
+// document store — is a one-word change with no component code
+// involved, which is what keeps the component generic across deploy
+// templates.
+//
+// Why a CONVENTION and not a lookup: the referenced resource is
+// provisioned in the same parent-stack update as this component, so at
+// PreProvision time it does not exist yet and its outputs cannot be
+// read. The sc-plugin-aws s3-bucket resource names its bucket
+// `<resourceName>--<env>` when the operator sets no explicit
+// `bucketName`, so that is derivable without a lookup. Verified against
+// a real preview plan rather than from reading the other plugin:
+// `storage: sc-observatory-data` in env `staging` planned
+// `aws:s3/bucket:Bucket::sc-observatory-data--staging` with
+// `bucket: "sc-observatory-data--staging"` (forge run 44469566225).
+//
+// The hole that leaves is an s3-bucket resource carrying an explicit
+// `bucketName`, which the convention cannot see. That case sets
+// `storage.bucket` explicitly — hence the map form below, which also
+// covers a bucket provisioned outside SC entirely.
+//
+// Accepted shapes, in order:
+//
+//  1. `storage: {bucket: "literal-name"}` — explicit, wins over
+//     everything. Also the escape hatch above.
+//  2. `storage: {name: "resource-name"}` — the reference, map form.
+//  3. `storage: "resource-name"` — the reference, the shape an
+//     operator actually writes.
+//  4. absent — the component names its own bucket. Keeps a
+//     zero-config deploy working, and is why `storage:` is optional.
+func BucketForStorageRef(raw map[string]any, resourceName, env string) string {
+	switch st := raw["storage"].(type) {
+	case string:
+		if name := strings.TrimSpace(st); name != "" {
+			return scResourceBucketName(name, env)
+		}
+	case map[string]any:
+		if b, ok := st["bucket"].(string); ok && strings.TrimSpace(b) != "" {
+			return strings.TrimSpace(b)
+		}
+		if n, ok := st["name"].(string); ok && strings.TrimSpace(n) != "" {
+			return scResourceBucketName(strings.TrimSpace(n), env)
+		}
+	}
+	return DefaultBucketName(resourceName, env)
+}
+
+// scResourceBucketName mirrors the s3-bucket resource's own naming:
+// `<resourceName>--<env>`.
+//
+// The double hyphen is SC's resource-name/environment separator and is
+// not cosmetic — a single one would collide with a resource name that
+// itself ends in `-staging`.
+func scResourceBucketName(resourceName, env string) string {
+	if env == "" {
+		return resourceName
+	}
+	return resourceName + "--" + env
+}
