@@ -8,10 +8,12 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/pkg/errors v0.9.1
 	github.com/pulumi/pulumi/sdk/v3 v3.245.0
-	github.com/simple-container-com/api v0.0.0-20261116212848-4fcb7fad78cd
+	github.com/simple-container-com/api v0.0.0-20261119042342-510d0e97d8e7
 )
 
 require github.com/pulumi/pulumi-aws/sdk/v6 v6.83.4
+
+require gotest.tools/v3 v3.5.0 // indirect
 
 require (
 	dario.cat/mergo v1.0.2 // indirect
@@ -152,11 +154,3 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	lukechampine.com/frand v1.5.1 // indirect
 )
-
-// Local api checkout while api#639 (client_descriptor_json on
-// ComputeProcessRequest) is unreleased. Replaced by a pinned
-// pseudo-version as soon as the preview build publishes — a `replace`
-// to a local path must NEVER be committed to a release branch, since
-// the release workflow builds in a clean checkout where ../api does
-// not exist.
-replace github.com/simple-container-com/api => /home/iasadykov/projects/github/simple-container/api
