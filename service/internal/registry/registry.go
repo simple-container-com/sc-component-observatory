@@ -166,6 +166,7 @@ func Register(ctx context.Context, store Store, incoming ServiceRecord, now time
 	}
 
 	previousVersion := ""
+	isNew := !found
 	if found {
 		previousVersion = existing.Version
 
@@ -211,8 +212,24 @@ func Register(ctx context.Context, store Store, incoming ServiceRecord, now time
 		return ServiceRecord{}, err
 	}
 
-	// Only a version change is a deploy worth timelining.
-	if rec.Version != previousVersion {
+	// A version change is a deploy — and so is the FIRST registration,
+	// whatever the version says.
+	//
+	// The `isNew` half is not redundant. Deploy-time version is not
+	// always knowable: the plugin bus carries no version field, so a
+	// component plugin can only read VERSION out of the env preceding
+	// `uses:` entries contributed, and a consumer that passes no build
+	// arg registers with Version "". The first registration then
+	// compared "" against "" and recorded NO deploy event at all — the
+	// deploy history stayed empty for a service that had demonstrably
+	// just deployed (live-caught 2026-11-19 on forge-storage, the first
+	// tenant: `deploys: 0` on a record whose `deployed_at` was two
+	// minutes old).
+	//
+	// A deploy we can timestamp but not version is still a deploy, and
+	// recording it with an empty version is strictly more honest than
+	// pretending it never happened.
+	if isNew || rec.Version != previousVersion {
 		ev := DeployEvent{
 			ID:              DeployEventID(rec.Stack, rec.Version, rec.DeployedAt),
 			Stack:           rec.Stack,

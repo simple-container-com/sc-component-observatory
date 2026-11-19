@@ -168,6 +168,22 @@ type HealthResult struct {
 	// the probe succeeded.
 	Error string `bson:"error,omitempty" json:"error,omitempty"`
 
+	// Version and Commit are what the probed service REPORTED about
+	// itself, when its health body is JSON carrying those fields.
+	//
+	// This is the live answer, and it is a different fact from the
+	// ServiceRecord's deploy-time Version — deliberately kept separate
+	// rather than overwriting it. The two disagreeing is precisely the
+	// signal that a deploy did not replace the running code, which is
+	// invisible if one value clobbers the other.
+	//
+	// It is also the only available answer when deploy-time version is
+	// unknown: the plugin bus carries no version field, so a consumer
+	// that passes no build arg registers with Version "". Reading it
+	// off the probe fills that in from the service's own mouth.
+	Version string `bson:"version,omitempty" json:"version,omitempty"`
+	Commit  string `bson:"commit,omitempty" json:"commit,omitempty"`
+
 	// URL actually probed, recorded so a wrong health path is visible
 	// in the UI rather than presenting as a down service.
 	URL string `bson:"url,omitempty" json:"url,omitempty"`

@@ -226,3 +226,78 @@ func normalizePath(p string) string {
 	}
 	return p
 }
+
+// EndpointURLFromClientConfig digs a consumer's own public base URL out
+// of its client config.
+//
+// Without this the registry records no endpoint, the health prober has
+// nothing to probe, and every tenant sits at `health: unknown` forever
+// — which is how the first real tenant registered (forge-storage,
+// 2026-11-19: a correct record with `endpoint_url: ""`).
+//
+// `config.domain` is the right source and is template-GENERIC: every SC
+// client stack that is reachable declares it, whatever it deploys to —
+// a Lambda behind a Function URL, an ECS service behind an ALB, a k8s
+// ingress. Deriving from the cloud's own address instead (a Function
+// URL, a load-balancer hostname) would be both cloud-specific and
+// wrong, since the operator's DNS name is the address the service is
+// actually served on.
+//
+// Checked in order:
+//
+//  1. `endpointUrl` / `publicUrl` — an explicit statement, for a
+//     service whose public address is not its `domain`.
+//  2. `domain` — the normal case.
+//  3. a compose stack's per-service `domain`, first one that has it.
+//
+// Returns "" when nothing is declared, which the prober records as
+// `unknown` rather than `down`: a service with no published endpoint is
+// a wiring gap, not an outage, and the two must stay distinguishable.
+func EndpointURLFromClientConfig(cfg map[string]any) string {
+	if cfg == nil {
+		return ""
+	}
+	if u := firstStringKey(cfg, "endpointUrl", "publicUrl", "domain"); u != "" {
+		return normalizeBaseURL(u)
+	}
+	if svcs, ok := cfg["services"].(map[string]any); ok {
+		for _, raw := range svcs {
+			svc, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if u := firstStringKey(svc, "endpointUrl", "publicUrl", "domain"); u != "" {
+				return normalizeBaseURL(u)
+			}
+		}
+	}
+	return ""
+}
+
+func firstStringKey(m map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := m[k].(string); ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+// normalizeBaseURL turns a bare hostname into an https base and strips
+// a trailing slash.
+//
+// https, not http: an SC-deployed service is always behind TLS (a
+// Function URL, a registrar-managed record, an ingress), and probing
+// http would either redirect — which the prober counts as UP, so the
+// reading would be of the redirect rather than the service — or fail
+// outright.
+func normalizeBaseURL(s string) string {
+	s = strings.TrimRight(strings.TrimSpace(s), "/")
+	if s == "" {
+		return ""
+	}
+	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
+		return s
+	}
+	return "https://" + s
+}
