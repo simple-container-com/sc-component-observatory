@@ -49,6 +49,21 @@ func (c *HealthConfig) now() time.Time {
 // bounded by concurrency and the per-probe timeout, so it fits a normal
 // request.
 func (c *HealthConfig) Tick(w http.ResponseWriter, r *http.Request) {
+	// Scheduler or operator only.
+	//
+	// Validity alone is not enough: every tenant's plugin holds a
+	// `register` token for push-registration, so accepting any valid
+	// token would let any consumer stack drive the whole fleet's sweep
+	// — and the sweep makes an outbound request to every registered
+	// endpoint, which is a usable amplifier.
+	//
+	// Operator stays allowed so an operator can force a sweep by hand,
+	// which is how this endpoint was exercised before it had a timer.
+	if claims := ClaimsFromContext(r.Context()); claims == nil ||
+		(claims.Op != OpScheduler && claims.Op != OpOperator) {
+		writeErr(w, http.StatusForbidden, "token op must be 'scheduler' or 'operator'")
+		return
+	}
 	if c.Registry == nil {
 		writeErr(w, http.StatusNotImplemented, "registry not wired")
 		return

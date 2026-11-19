@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/hashicorp/go-hclog"
 	hplugin "github.com/hashicorp/go-plugin"
@@ -108,6 +109,64 @@ var componentDefaultsJSON = func() []byte {
 			// routes answers 404 for all of them — the stage-prefix
 			// doubling that cost sc-component-backup a deploy cycle.
 			"lambdaRoutingType": "function-url",
+			// The healthcheck sweep's timer.
+			//
+			// WITHOUT THIS NOTHING EVER PROBES. The service exposes
+			// POST /api/v1/scheduler/healthcheck/tick and runs the sweep
+			// inline when it is called; nothing calls it on its own. A
+			// Lambda cannot hold a ticker — the runtime freezes
+			// background goroutines the moment the handler returns — so
+			// the timer has to be a platform resource, and on aws-lambda
+			// that is an EventBridge rule the template builds from this
+			// list. Live-caught 2026-11-19: health on the dashboard only
+			// ever changed when an operator curled the endpoint by hand,
+			// and `aws events list-rules` showed no rule at all.
+			//
+			// `rate(5 minutes)` matches api.DefaultHealthcheckInterval.
+			// The prune piggybacks on the same tick, so retention only
+			// runs because this does.
+			//
+			// The name is 7 characters: the template rejects a schedule
+			// name over 14 at APPLY time, which is after the preview has
+			// already passed.
+			//
+			// The Authorization value comes from the operator's own
+			// `schedulerToken` field, carried here as a PreProvision tpl
+			// extension — the same mechanism as self-url and
+			// storage-bucket. It must NOT name a secret directly: these
+			// defaults ship to every operator of this component, and a
+			// hardcoded `${secret:sc-observatory-scheduler-token}` would
+			// only resolve on the one stack that happens to use that
+			// name.
+			//
+			// The token is minted with `op: "scheduler"`, which the tick
+			// handler requires — so the credential sitting in the rule's
+			// input can do exactly one thing: fire a sweep. It cannot
+			// read the registry, cannot register a tenant and cannot
+			// reach any other route.
+			"lambdaSchedules": []map[string]any{
+				{
+					"name":       "hc-tick",
+					"expression": "rate(5 minutes)",
+					"request": `{
+  "requestId": "scheduled-healthcheck",
+  "requestTime": "2026-01-01T00:00:00.000Z",
+  "httpMethod": "POST",
+  "path": "/api/v1/scheduler/healthcheck/tick",
+  "requestContext": {
+    "http": {
+      "path": "/api/v1/scheduler/healthcheck/tick",
+      "method": "POST",
+      "protocol": "HTTP/1.1"
+    }
+  },
+  "body": "{}",
+  "headers": {
+    "Authorization": "Bearer $$sc:${resource:${name}.scheduler-token}"
+  }
+}`,
+				},
+			},
 			"awsRoles": []string{
 				// Storage — the component's own bucket: registry
 				// records, deploy history, health results.
@@ -208,6 +267,10 @@ func (p *observatoryPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaReques
 				"maxMemory", "timeout",
 				// Component-specific top-level keys.
 				"storage", "metadata", "operatorPassword", "readers",
+				// The `op: "scheduler"` token the EventBridge rule
+				// presents on the tick. Scoped to that one route, so the
+				// credential in the rule's input can only fire a sweep.
+				"schedulerToken",
 				// Grandfather for the aws-lambda template's
 				// per-Component resource naming (sc-plugin-aws#28): keeps
 				// a Component deployed BEFORE that scoping on its
@@ -275,6 +338,12 @@ func (p *observatoryPlugin) PreProvision(stdctx context.Context, req *scpluginv1
 		"self-url":       observatory.SelfURLFromConfig(raw),
 		"storage-bucket": storageBucket(raw, resName, env),
 		"storage-region": storageRegion(raw),
+		// The credential the deploy template's timer presents on the
+		// healthcheck tick. Landed as a tpl extension rather than named
+		// as a secret inside ComponentDefaults, because those defaults
+		// ship to every operator and must not assume one stack's secret
+		// names.
+		"scheduler-token": schedulerToken(raw),
 	}
 
 	return runtime.RunPreProvision(
@@ -303,6 +372,22 @@ func (p *observatoryPlugin) PreProvision(stdctx context.Context, req *scpluginv1
 // lookup.
 func storageBucket(raw map[string]any, resName, env string) string {
 	return observatory.BucketForStorageRef(raw, resName, env)
+}
+
+// schedulerToken is the operator-declared credential the deploy
+// template's timer presents on the healthcheck tick.
+//
+// Returns "" when unset, and the schedule then carries an empty bearer
+// and the tick 401s. That is deliberately LOUD rather than silently
+// skipping the schedule: a dashboard whose health never updates looks
+// identical to a healthy fleet, which is the failure this whole slice
+// exists to remove. A 401 every five minutes in the service's own log
+// is a thing an operator can find.
+func schedulerToken(raw map[string]any) string {
+	if v, ok := raw["schedulerToken"].(string); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
 }
 
 // storageRegion defaults to eu-central-1, matching the fleet's primary.
