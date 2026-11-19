@@ -109,64 +109,39 @@ var componentDefaultsJSON = func() []byte {
 			// routes answers 404 for all of them — the stage-prefix
 			// doubling that cost sc-component-backup a deploy cycle.
 			"lambdaRoutingType": "function-url",
-			// The healthcheck sweep's timer.
+			// NO lambdaSchedules HERE — see below. The timer is real and
+			// required, but its Authorization header cannot be expressed
+			// in these generic defaults.
 			//
-			// WITHOUT THIS NOTHING EVER PROBES. The service exposes
-			// POST /api/v1/scheduler/healthcheck/tick and runs the sweep
-			// inline when it is called; nothing calls it on its own. A
-			// Lambda cannot hold a ticker — the runtime freezes
-			// background goroutines the moment the handler returns — so
-			// the timer has to be a platform resource, and on aws-lambda
-			// that is an EventBridge rule the template builds from this
-			// list. Live-caught 2026-11-19: health on the dashboard only
-			// ever changed when an operator curled the endpoint by hand,
-			// and `aws events list-rules` showed no rule at all.
+			// The service exposes POST
+			// /api/v1/scheduler/healthcheck/tick and runs the sweep
+			// inline when called; nothing calls it on its own, and a
+			// Lambda cannot hold a ticker (the runtime freezes
+			// background goroutines when the handler returns). So the
+			// timer has to be a platform resource — on aws-lambda, an
+			// EventBridge rule built from `cloudExtras.lambdaSchedules`.
 			//
-			// `rate(5 minutes)` matches api.DefaultHealthcheckInterval.
-			// The prune piggybacks on the same tick, so retention only
-			// runs because this does.
+			// Why the OPERATOR declares it rather than this file:
+			// SC resolves `${secret:NAME}` inside a schedule's request
+			// payload, but NOT the `$$sc:${resource:<name>.key}`
+			// tpl-extension form. Live-proven 2026-11-19 — the rule was
+			// created correctly, fired on time, and the tick answered
+			// 401 twice (10:56:13, 11:01:13) because its input held the
+			// literal string `Bearer $$sc:${resource:${name}.scheduler-token}`.
 			//
-			// The name is 7 characters: the template rejects a schedule
-			// name over 14 at APPLY time, which is after the preview has
-			// already passed.
+			// A generic component cannot hardcode one stack's secret
+			// NAME, and the only form that resolves there needs exactly
+			// that. So the schedule block lives in the operator's
+			// server.yaml, which this component's README spells out
+			// verbatim, and `schedulerToken` stays on the allowlist so
+			// the operator declares the credential once.
 			//
-			// The Authorization value comes from the operator's own
-			// `schedulerToken` field, carried here as a PreProvision tpl
-			// extension — the same mechanism as self-url and
-			// storage-bucket. It must NOT name a secret directly: these
-			// defaults ship to every operator of this component, and a
-			// hardcoded `${secret:sc-observatory-scheduler-token}` would
-			// only resolve on the one stack that happens to use that
-			// name.
-			//
-			// The token is minted with `op: "scheduler"`, which the tick
-			// handler requires — so the credential sitting in the rule's
-			// input can do exactly one thing: fire a sweep. It cannot
-			// read the registry, cannot register a tenant and cannot
-			// reach any other route.
-			"lambdaSchedules": []map[string]any{
-				{
-					"name":       "hc-tick",
-					"expression": "rate(5 minutes)",
-					"request": `{
-  "requestId": "scheduled-healthcheck",
-  "requestTime": "2026-01-01T00:00:00.000Z",
-  "httpMethod": "POST",
-  "path": "/api/v1/scheduler/healthcheck/tick",
-  "requestContext": {
-    "http": {
-      "path": "/api/v1/scheduler/healthcheck/tick",
-      "method": "POST",
-      "protocol": "HTTP/1.1"
-    }
-  },
-  "body": "{}",
-  "headers": {
-    "Authorization": "Bearer $$sc:${resource:${name}.scheduler-token}"
-  }
-}`,
-				},
-			},
+			// Follow-up that would move this back here: teach SC core's
+			// placeholder pass to walk `cloudExtras`. Until then,
+			// keeping a non-resolving schedule in the defaults would be
+			// worse than none — it produces a rule that fires every five
+			// minutes and 401s, which reads as "the dashboard is broken"
+			// rather than "configure the token".
 			"awsRoles": []string{
 				// Storage — the component's own bucket: registry
 				// records, deploy history, health results.
