@@ -145,6 +145,23 @@ func (p *observatoryPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaReques
 				"maxMemory", "timeout",
 				// Component-specific top-level keys.
 				"storage", "metadata", "operatorPassword", "readers",
+				// Grandfather for the aws-lambda template's
+				// per-Component resource naming (sc-plugin-aws#28): keeps
+				// a Component deployed BEFORE that scoping on its
+				// un-scoped names, because switching over is a pure
+				// rename and Pulumi matches by name — so the plan would
+				// create new resources and DELETE the live ones.
+				//
+				// This component has never deployed un-scoped, so it
+				// will never need the flag. It is on the allowlist so an
+				// operator who hits the same situation on a FUTURE
+				// template-naming change has the same escape, and so the
+				// key means the same thing on every Component rather
+				// than being refused here and accepted next door. Here
+				// only because SC core dual-uses this list as
+				// allowed-top-level-keys; the key is read by the
+				// template plugin, not by this one.
+				"legacyResourceNames",
 			}},
 		},
 
