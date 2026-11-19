@@ -297,6 +297,7 @@ type registerRequest struct {
 	Template    string   `json:"template"`
 	Version     string   `json:"version"`
 	Commit      string   `json:"commit"`
+	Repository  string   `json:"repository"`
 	EndpointURL string   `json:"endpoint_url"`
 	Inferred    bool     `json:"inferred"`
 	Regions     []string `json:"regions"`
@@ -354,6 +355,7 @@ func (c *ServicesConfig) Register(w http.ResponseWriter, r *http.Request) {
 		Template:     body.Template,
 		Version:      body.Version,
 		Commit:       body.Commit,
+		Repository:   body.Repository,
 		EndpointURL:  body.EndpointURL,
 		Inferred:     body.Inferred,
 		Regions:      body.Regions,

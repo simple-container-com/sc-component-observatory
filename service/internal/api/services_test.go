@@ -9,6 +9,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -301,4 +304,73 @@ func TestErrorsAreJSON(t *testing.T) {
 			t.Errorf("%s %s: error body missing 'error' key: %v", tc.method, tc.path, body)
 		}
 	}
+}
+
+// TestRegisterRequest_CoversEveryRecordField is the guard for a whole
+// CLASS of silent data loss, not just the one instance that prompted it.
+//
+// Registration decodes into `registerRequest` and then copies field by
+// field into registry.ServiceRecord. Adding a field to the record and to
+// the plugin that sends it is NOT enough — if the DTO lacks it, the JSON
+// key is dropped at the door and everything downstream compiles, runs,
+// and shows a blank.
+//
+// Live-caught 2026-11-19: `repository` was added to the plugin's wire
+// type, the ServiceRecord, the merge rules, the API output and the SPA,
+// and still arrived empty, because `registerRequest` never learned the
+// field. Nothing failed; the dashboard just had no repository.
+//
+// This compares the two structs by JSON tag and fails on any record
+// field a consumer can legitimately report that the DTO cannot receive.
+func TestRegisterRequest_CoversEveryRecordField(t *testing.T) {
+	// Fields the record owns and a consumer must NOT be able to set:
+	// observed by the service itself, or derived.
+	serviceOwned := map[string]bool{
+		"first_seen_at": true, // observed, never self-reported
+		"last_seen_at":  true,
+		"deployed_at":   true, // observed at ComputeProcess time
+		"sources":       true, // handled separately (nested shape)
+		"stale":         true, // derived at render time
+		// Derived from the stack name by SplitStack on every Register,
+		// so accepting them from a consumer would let a caller claim a
+		// service/env that disagrees with the stack its JWT is scoped to.
+		"service": true,
+		"env":     true,
+	}
+
+	dtoTags := jsonTags(reflect.TypeOf(registerRequest{}))
+	// Sorted so a failure lists fields deterministically rather than in
+	// Go's randomised map order.
+	recordTags := make([]string, 0)
+	for tag := range jsonTags(reflect.TypeOf(registry.ServiceRecord{})) {
+		recordTags = append(recordTags, tag)
+	}
+	sort.Strings(recordTags)
+
+	for _, tag := range recordTags {
+		if serviceOwned[tag] || dtoTags[tag] {
+			continue
+		}
+		t.Errorf("registry.ServiceRecord has %q but registerRequest cannot receive it — "+
+			"a consumer reporting that field would be silently dropped at the door", tag)
+	}
+}
+
+// jsonTags returns the set of json tag names on a struct, ignoring
+// options like ",omitempty" and skipping fields tagged "-".
+func jsonTags(t reflect.Type) map[string]bool {
+	out := map[string]bool{}
+	for i := 0; i < t.NumField(); i++ {
+		tag := t.Field(i).Tag.Get("json")
+		if tag == "" || tag == "-" {
+			continue
+		}
+		if comma := strings.Index(tag, ","); comma >= 0 {
+			tag = tag[:comma]
+		}
+		if tag != "" {
+			out[tag] = true
+		}
+	}
+	return out
 }
