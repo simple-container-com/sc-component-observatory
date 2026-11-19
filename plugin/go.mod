@@ -11,8 +11,6 @@ require (
 	github.com/simple-container-com/api v0.0.0-20261119042342-510d0e97d8e7
 )
 
-require github.com/pulumi/pulumi-aws/sdk/v6 v6.83.4
-
 require gotest.tools/v3 v3.5.0 // indirect
 
 require (

@@ -78,6 +78,69 @@ var componentDefaultsJSON = func() []byte {
 		"timeout":   30,
 		"metadata":  map[string]any{"type": "colocated"},
 		"storage":   map[string]any{"type": "s3"},
+		// The permissions this component needs, declared BY THE
+		// COMPONENT and granted BY THE TEMPLATE.
+		//
+		// This is the division the generic design turns on. The
+		// component knows what it must be able to do — read logs,
+		// read metrics, discover which resources exist, read and write
+		// its own storage. It must NOT know how the chosen cloud
+		// expresses that: an IAM policy here, folder roles on Yandex,
+		// a ClusterRole on Kubernetes. So it names actions in the
+		// template's own vocabulary under the template's key
+		// (`cloudExtras.awsRoles` for aws-lambda) and the template
+		// attaches them to the service's own identity. No access key
+		// is created, so there is nothing to store, rotate or leak,
+		// and the operator writes none of it.
+		//
+		// The read set is least-privilege, derived from what the
+		// service actually calls rather than from a convenience
+		// wildcard — a managed ReadOnlyAccess would grant read on
+		// every service in the account, which is both more than this
+		// needs and more than an operator should have to accept to get
+		// a dashboard. There is no Put, Create or Delete outside the
+		// component's own bucket: a dashboard that can change
+		// infrastructure is a liability.
+		"cloudExtras": map[string]any{
+			// Function URL, not API Gateway. The APIGW path mounts the
+			// lambda under a stage named "api", so every request
+			// arrives path-prefixed and a SPA that serves its own
+			// routes answers 404 for all of them — the stage-prefix
+			// doubling that cost sc-component-backup a deploy cycle.
+			"lambdaRoutingType": "function-url",
+			"awsRoles": []string{
+				// Storage — the component's own bucket: registry
+				// records, deploy history, health results.
+				"s3:PutObject", "s3:GetObject", "s3:ListBucket",
+				"s3:DeleteObject", "s3:AbortMultipartUpload",
+
+				// Logs. DescribeLogGroups/Streams resolve an inferred
+				// log-group PREFIX to concrete groups, because the
+				// Pulumi-generated function suffix is not derivable.
+				// FilterLogEvents/GetLogEvents tail and search.
+				// StartQuery/GetQueryResults/StopQuery run Insights for
+				// what a filter cannot express.
+				"logs:DescribeLogGroups", "logs:DescribeLogStreams",
+				"logs:FilterLogEvents", "logs:GetLogEvents",
+				"logs:StartQuery", "logs:StopQuery",
+				"logs:GetQueryResults", "logs:DescribeQueries",
+
+				// Metrics. ListMetrics discovers which dimensions
+				// actually exist, so a metric the service never emitted
+				// renders as absent rather than as an empty chart.
+				"cloudwatch:GetMetricData", "cloudwatch:GetMetricStatistics",
+				"cloudwatch:ListMetrics",
+
+				// Discovery — resolve a stack name to its live
+				// resources. Needed because the registry records what
+				// SC deployed, while these answer what is actually
+				// running.
+				"lambda:ListFunctions", "lambda:GetFunction",
+				"lambda:GetFunctionConfiguration", "lambda:ListTags",
+				"ecs:ListClusters", "ecs:ListServices", "ecs:DescribeServices",
+				"ecs:ListTasks", "ecs:DescribeTasks", "ecs:DescribeTaskDefinition",
+			},
+		},
 		"env": map[string]any{
 			// The service's own public URL, derived from
 			// ingress.hostname at PreProvision. Lets the deployed
@@ -233,15 +296,13 @@ func (p *observatoryPlugin) PreProvision(stdctx context.Context, req *scpluginv1
 	)
 }
 
-// storageBucket honours an operator-named bucket and otherwise derives
-// one, so `storage:` can be omitted entirely.
+// storageBucket resolves the operator's `storage:` declaration — a
+// REFERENCE to another SC resource — to the physical bucket the
+// deployed service uses. See observatory.BucketForStorageRef for the
+// accepted shapes and why the resolution is a convention rather than a
+// lookup.
 func storageBucket(raw map[string]any, resName, env string) string {
-	if st, ok := raw["storage"].(map[string]any); ok {
-		if b, ok := st["bucket"].(string); ok && b != "" {
-			return b
-		}
-	}
-	return observatory.DefaultBucketName(resName, env)
+	return observatory.BucketForStorageRef(raw, resName, env)
 }
 
 // storageRegion defaults to eu-central-1, matching the fleet's primary.

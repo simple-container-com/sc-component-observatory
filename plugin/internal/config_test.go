@@ -98,3 +98,61 @@ func TestReadSigningKey_HappyPath(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+// TestBucketForStorageRef covers the operator-facing contract the
+// mandate turns on: `storage:` names another SC RESOURCE, not a bucket.
+//
+// The string form is the one an operator actually writes, and it was
+// the one that silently did not work: the first implementation only
+// looked for a `storage.bucket` map key, so `storage:
+// sc-observatory-data` fell through to the component's own default
+// name. The deploy was green, the preview plan created
+// `sc-observatory-data--staging`, and the Lambda was handed
+// `STORAGE_BUCKET=sc-observatory-my-observatory-staging` — a bucket
+// that does not exist. Nothing failed until the first write.
+func TestBucketForStorageRef(t *testing.T) {
+	// 3. The shape an operator writes: a resource name.
+	if got := BucketForStorageRef(map[string]any{
+		"storage": "sc-observatory-data",
+	}, "my-observatory", "staging"); got != "sc-observatory-data--staging" {
+		t.Errorf("string resource ref: got %q, want sc-observatory-data--staging", got)
+	}
+
+	// 2. The same reference in map form.
+	if got := BucketForStorageRef(map[string]any{
+		"storage": map[string]any{"name": "sc-observatory-data"},
+	}, "my-observatory", "staging"); got != "sc-observatory-data--staging" {
+		t.Errorf("map name ref: got %q, want sc-observatory-data--staging", got)
+	}
+
+	// 1. An explicit bucket wins over everything — the escape hatch for
+	// an s3-bucket resource carrying its own `bucketName`, which the
+	// convention cannot see.
+	if got := BucketForStorageRef(map[string]any{
+		"storage": map[string]any{
+			"name":   "sc-observatory-data",
+			"bucket": "an-explicitly-named-bucket",
+		},
+	}, "my-observatory", "staging"); got != "an-explicitly-named-bucket" {
+		t.Errorf("explicit bucket: got %q, want an-explicitly-named-bucket", got)
+	}
+
+	// 4. Absent: the component names its own, so a zero-config deploy
+	// still works and `storage:` stays optional.
+	if got := BucketForStorageRef(map[string]any{}, "my-observatory", "staging"); got != DefaultBucketName("my-observatory", "staging") {
+		t.Errorf("absent storage: got %q, want the default", got)
+	}
+
+	// Whitespace-only must not resolve to `--staging`, a bucket name
+	// with an empty resource segment. SC core's destructive-rename
+	// guard exists because exactly that class of empty segment reaches
+	// a live plan.
+	if got := BucketForStorageRef(map[string]any{"storage": "   "}, "my-observatory", "staging"); got != DefaultBucketName("my-observatory", "staging") {
+		t.Errorf("blank storage: got %q, want the default", got)
+	}
+
+	// An env-less dispatch must not append a dangling separator.
+	if got := BucketForStorageRef(map[string]any{"storage": "data"}, "obs", ""); got != "data" {
+		t.Errorf("empty env: got %q, want data", got)
+	}
+}
