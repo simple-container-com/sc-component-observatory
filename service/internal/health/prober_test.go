@@ -143,3 +143,85 @@ func TestJoinHealthURL(t *testing.T) {
 		}
 	}
 }
+
+// TestSweep_FallsBackToHealthOn404 covers the fleet's split spelling.
+//
+// forge-notifier, forge-storage, forge-aigateway and forge-conductor
+// serve /healthz; forge-concierge and forge-sessions serve /health.
+// Neither is wrong, and there is nowhere to record the difference — SC's
+// client config has no healthPath field, so a value written there is
+// dropped at parse and never reaches the descriptor this component
+// reads.
+//
+// So a 404 on a DEFAULT path gets one more try. Without this, half the
+// fleet would show permanently DOWN while being perfectly healthy —
+// which is the single most damaging thing a monitoring dashboard can
+// do, because it trains the operator to ignore red.
+func TestSweep_FallsBackToHealthOn404(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.URL.Path == "/health" {
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	store := registry.NewInMemoryStore()
+	if _, err := registry.Register(context.Background(), store, registry.ServiceRecord{
+		Stack:       "forge-sessions--staging",
+		EndpointURL: srv.URL,
+	}, time.Now().UTC()); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	res, err := Sweep(context.Background(), store, NewHTTPProber(2*time.Second), SweepConfig{DefaultPath: "/healthz"})
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if len(res) != 1 || res[0].Status != registry.HealthUp {
+		t.Fatalf("status = %+v, want up via the /health fallback", res)
+	}
+	if len(paths) != 2 || paths[0] != "/healthz" || paths[1] != "/health" {
+		t.Errorf("paths probed = %v, want [/healthz /health]", paths)
+	}
+}
+
+// TestSweep_DeclaredPathIsNotSecondGuessed — a path the service
+// DECLARED is authoritative. If an operator says the probe lives at
+// /ping, a 404 there is a real failure, and quietly succeeding on some
+// other path would hide a broken deploy behind a green tick.
+func TestSweep_DeclaredPathIsNotSecondGuessed(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.URL.Path == "/health" {
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	store := registry.NewInMemoryStore()
+	if _, err := registry.Register(context.Background(), store, registry.ServiceRecord{
+		Stack:       "declared--staging",
+		EndpointURL: srv.URL,
+		HealthPath:  "/ping",
+	}, time.Now().UTC()); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	res, err := Sweep(context.Background(), store, NewHTTPProber(2*time.Second), SweepConfig{DefaultPath: "/healthz"})
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if res[0].Status != registry.HealthDown {
+		t.Errorf("status = %q, want down — a declared path must not be second-guessed", res[0].Status)
+	}
+	if len(paths) != 1 || paths[0] != "/ping" {
+		t.Errorf("paths probed = %v, want only [/ping]", paths)
+	}
+}

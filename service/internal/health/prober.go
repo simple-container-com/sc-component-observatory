@@ -82,6 +82,22 @@ func NewHTTPProber(timeout time.Duration) *HTTPProber {
 // sweep. The alternative — simply raising the timeout — would make
 // every sweep wait longer on real outages without ever distinguishing
 // "slow to wake" from "not there".
+// FallbackPaths are tried, in order, when the first probe 404s and the
+// service declared no health path of its own.
+//
+// The fleet does not agree on a spelling: forge-notifier, forge-storage,
+// forge-aigateway and forge-conductor serve /healthz; forge-concierge
+// and forge-sessions serve /health. Neither is wrong, and there is
+// nowhere to record the difference — SC's client config has no
+// healthPath field, so a value written there is dropped at parse and
+// never reaches the descriptor this component reads.
+//
+// Only a 404 triggers the fallback, and only when the path was a
+// default rather than a declaration. A 500 means the right endpoint is
+// unhealthy, and retrying a different path would convert a real outage
+// into a green tick.
+var FallbackPaths = []string{"/health"}
+
 func (p *HTTPProber) Probe(ctx context.Context, url string) registry.HealthResult {
 	res := p.probeOnce(ctx, url)
 	if res.Status != registry.HealthDown || res.HTTPStatus != 0 {
@@ -237,6 +253,12 @@ func Sweep(ctx context.Context, store registry.Store, prober Prober, cfg SweepCo
 		stack  string
 		region string
 		url    string
+		// base is the endpoint without a path, set only when the path
+		// was a DEFAULT rather than something the service declared.
+		// A declared path is authoritative: if an operator says the
+		// probe lives at /ping, a 404 there is a real failure and
+		// guessing elsewhere would hide it.
+		base string
 	}
 	var jobs []job
 	for _, rec := range records {
@@ -248,12 +270,16 @@ func Sweep(ctx context.Context, store registry.Store, prober Prober, cfg SweepCo
 			continue
 		}
 		url := JoinHealthURL(rec.EndpointURL, firstNonEmpty(rec.HealthPath, cfg.DefaultPath))
+		base := ""
+		if rec.HealthPath == "" {
+			base = rec.EndpointURL
+		}
 		if len(rec.Regions) == 0 {
-			jobs = append(jobs, job{stack: rec.Stack, url: url})
+			jobs = append(jobs, job{stack: rec.Stack, url: url, base: base})
 			continue
 		}
 		for _, region := range rec.Regions {
-			jobs = append(jobs, job{stack: rec.Stack, region: region, url: url})
+			jobs = append(jobs, job{stack: rec.Stack, region: region, url: url, base: base})
 		}
 	}
 
@@ -279,6 +305,20 @@ func Sweep(ctx context.Context, store registry.Store, prober Prober, cfg SweepCo
 				}
 			} else {
 				res = prober.Probe(ctx, j.url)
+				// The fleet does not agree on /healthz vs /health, and
+				// SC's client config has nowhere to record which — so a
+				// 404 on a DEFAULT path is a spelling mismatch worth one
+				// more try, not an outage. `base` is empty when the
+				// service declared its own path, which is authoritative.
+				if j.base != "" && res.HTTPStatus == http.StatusNotFound {
+					for _, alt := range FallbackPaths {
+						altRes := prober.Probe(ctx, JoinHealthURL(j.base, alt))
+						if altRes.Status == registry.HealthUp {
+							res = altRes
+							break
+						}
+					}
+				}
 			}
 			res.Stack = j.stack
 			res.Region = j.region
