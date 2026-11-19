@@ -284,7 +284,25 @@ func (p *observatoryPlugin) ComputeProcess(stdctx context.Context, req *scplugin
 	}
 	input := runtime.ResourceInputForComputeProcess(req, parent, componentRaw)
 
-	processor := observatory.NewProcessor(observatory.ProcessorConfig{Progress: p.progress})
+	// The consuming stack's own client descriptor (api#639). Raw/map
+	// form, not typed: this is FORWARDED to the service rather than
+	// interpreted, and round-tripping through a typed struct would
+	// silently drop any field this plugin's pinned api version does not
+	// know about yet.
+	//
+	// A decode failure is logged and ignored rather than failing the
+	// consumer's deploy — the dashboard losing one field of context is
+	// not worth blocking a release over.
+	clientCfg, cErr := runtime.ClientDescriptorRawFromComputeProcessRequest(req)
+	if cErr != nil {
+		p.progress.Warn("compute-process", "client descriptor decode: "+cErr.Error()+" — registering without the consumer's config")
+		clientCfg = nil
+	}
+
+	processor := observatory.NewProcessor(observatory.ProcessorConfig{
+		Progress:     p.progress,
+		ClientConfig: clientCfg,
+	})
 
 	// WithIncomingEnvVars seeds the collector from the shared compute
 	// context, so this processor sees env emitted by PRECEDING `uses:`

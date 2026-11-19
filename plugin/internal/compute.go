@@ -47,6 +47,13 @@ var backoffSeconds = []int{1, 2, 4}
 type ProcessorConfig struct {
 	Progress   *scPlugin.Publisher
 	HTTPClient *http.Client
+
+	// ClientConfig is the consuming stack's own client descriptor,
+	// decoded from ComputeProcessRequest.client_descriptor_json
+	// (api#639). Nil against an older SC core — the processor degrades
+	// to recording deploy facts without the consumer's config, which is
+	// the pre-api#639 behaviour.
+	ClientConfig map[string]any
 }
 
 // Processor is the ComputeProcessor for a `uses: [my-observatory]`
@@ -72,6 +79,14 @@ type ServiceRecord struct {
 	EndpointURL string            `json:"endpoint_url,omitempty"`
 	Inferred    bool              `json:"inferred,omitempty"`
 	Sources     []TelemetrySource `json:"sources,omitempty"`
+	Regions     []string          `json:"regions,omitempty"`
+	HealthPath  string            `json:"health_path,omitempty"`
+
+	// ClientConfig is the consumer's own client descriptor, SANITIZED.
+	// Carried so the dashboard can show what was actually deployed —
+	// template, compute shape, schedules, the `uses:` list — without
+	// the component guessing in advance which fields matter.
+	ClientConfig map[string]any `json:"client_config,omitempty"`
 }
 
 // Process registers the consumer with the observatory service.
@@ -97,7 +112,7 @@ func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInp
 		return nil, errors.Wrapf(err, "component %q unable to resolve signingKey", resName)
 	}
 
-	rec := p.buildRecord(stackName, input, collector)
+	rec := p.buildRecord(stackName, input, collector, p.cfg.ClientConfig)
 
 	token, err := mintJWT(signingKey, stackName, jwtLifetime)
 	if err != nil {
@@ -141,7 +156,7 @@ func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInp
 // is NOT auto-injected (the deploy action exports GITHUB_SHA and
 // services opt into passing it as a build arg), so it is best-effort
 // and the service falls back to the short SHA inside the CalVer string.
-func (p *Processor) buildRecord(stackName string, input api.ResourceInput, collector pApi.ComputeContextCollector) ServiceRecord {
+func (p *Processor) buildRecord(stackName string, input api.ResourceInput, collector pApi.ComputeContextCollector, clientCfg map[string]any) ServiceRecord {
 	template := p.deriveTemplate(input)
 	region := p.deriveRegion(input)
 
@@ -153,6 +168,27 @@ func (p *Processor) buildRecord(stackName string, input api.ResourceInput, colle
 	}
 	if cloud, ok := CloudForTemplate(template); ok {
 		rec.Cloud = cloud
+	}
+
+	// The consumer's own client config, from the api field added in
+	// api#639. Sanitized here at the SOURCE rather than at render time,
+	// because it lands in object storage and is served to a browser —
+	// stripping downstream would mean every future endpoint has to
+	// remember to do it.
+	//
+	// Absent against an older SC core, in which case the dashboard
+	// simply has no config to show and the service's own health path
+	// falls back to the component default.
+	if len(clientCfg) > 0 {
+		rec.ClientConfig = SanitizeClientConfig(clientCfg)
+		// The consumer knows where its own probe lives better than a
+		// fleet-wide default does.
+		rec.HealthPath = HealthPathFromClientConfig(clientCfg)
+		// A template that only names one region still deploys to one;
+		// recording it lets the dashboard label the probe.
+		if region := p.deriveRegion(input); region != "" {
+			rec.Regions = []string{region}
+		}
 	}
 
 	// Prefer handles the owning template plugin published; fall back to

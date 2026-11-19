@@ -247,6 +247,8 @@ github.com/pulumi/appdash v0.0.0-20231130102222-75f619a67231 h1:vkHw5I/plNdTr435
 github.com/pulumi/appdash v0.0.0-20231130102222-75f619a67231/go.mod h1:murToZ2N9hNJzewjHBgfFdXhZKjY3z5cYC1VXk+lbFE=
 github.com/pulumi/esc v0.24.0 h1:sCtiB0qbyrlU1ZNzJn4dTLYiChl8xeCBFbHWl1YoXJg=
 github.com/pulumi/esc v0.24.0/go.mod h1:eCOOkcDJS6eooGwdE4/E0+pOsvUWG254+KBmPCFwJpA=
+github.com/pulumi/pulumi-aws/sdk/v6 v6.83.4 h1:rI5FtYK0SY5VKPIRqwCqpnLJ7G7BeD4CAWb/ZdtzX8w=
+github.com/pulumi/pulumi-aws/sdk/v6 v6.83.4/go.mod h1:Ndpr97C9U/oghSpYch31qh2qxFGaODIw6FH2h8YfEVM=
 github.com/pulumi/pulumi/sdk/v3 v3.245.0 h1:HvHDnraVlRm64xJJx38/hPNnTpfkOlfm7fHDSwyJJaE=
 github.com/pulumi/pulumi/sdk/v3 v3.245.0/go.mod h1:BPWWuYPXcPH5YbXGoyy9Rrfa+evrh6IdM51AjDhcDpM=
 github.com/rivo/uniseg v0.4.7 h1:WUdvkW8uEhrYfLC4ZzdpI2ztxP1I582+49Oc5Mq64VQ=
@@ -260,8 +262,6 @@ github.com/santhosh-tekuri/jsonschema/v5 v5.3.1 h1:lZUw3E0/J3roVtGQ+SCrUrg3ON6Ng
 github.com/santhosh-tekuri/jsonschema/v5 v5.3.1/go.mod h1:uToXkOrWAZ6/Oc07xWQrPOhJotwFIyu2bBVN41fcDUY=
 github.com/sergi/go-diff v1.4.0 h1:n/SP9D5ad1fORl+llWyN+D6qoUETXNZARKjyY2/KVCw=
 github.com/sergi/go-diff v1.4.0/go.mod h1:A0bzQcvG0E7Rwjx0REVgAGH58e96+X0MeOfepqsbeW4=
-github.com/simple-container-com/api v0.0.0-20261116212848-4fcb7fad78cd h1:OOnACeA1W5Broa5C0OHAgntx5/3KCc2KiRTs0mTEujs=
-github.com/simple-container-com/api v0.0.0-20261116212848-4fcb7fad78cd/go.mod h1:BHezYLgfzDwf6PNZJwuQgnqSqIo7SwzhSivEy50CNoU=
 github.com/sirupsen/logrus v1.7.0/go.mod h1:yWOB1SBYBC5VeMP7gHvWumXLIWorT60ONWic61uBYv0=
 github.com/sirupsen/logrus v1.9.4 h1:TsZE7l11zFCLZnZ+teH4Umoq5BhEIfIzfRDZ1Uzql2w=
 github.com/sirupsen/logrus v1.9.4/go.mod h1:ftWc9WdOfJ0a92nsE2jF5u5ZwH8Bv2zdeOC42RjbV2g=
