@@ -16,7 +16,9 @@ package health
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -85,11 +87,58 @@ func (p *HTTPProber) Probe(ctx context.Context, url string) registry.HealthResul
 	res.HTTPStatus = resp.StatusCode
 	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
 		res.Status = registry.HealthUp
+		res.Version, res.Commit = versionFromProbeBody(resp.Body)
 	} else {
 		res.Status = registry.HealthDown
 		res.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
 	}
 	return res
+}
+
+// maxHealthBody caps how much of a probe response is read.
+//
+// A health endpoint answers in bytes; anything larger is a service
+// serving its SPA shell (or an error page) on the health path, and
+// reading it in full would mean an unbounded read per probe per sweep.
+const maxHealthBody = 8 << 10
+
+// versionFromProbeBody reads the version and commit a service reports
+// about itself.
+//
+// Entirely best-effort and deliberately quiet. A service that answers
+// 200 with an empty body, with HTML, or with JSON in some other shape
+// is HEALTHY — that is what the status code said — and must not be
+// downgraded or logged as an error because its body did not match a
+// convention it never agreed to.
+//
+// The convention it looks for is the one the fleet's own services
+// follow:
+//
+//	{"status":"ok","service":"forge-storage","version":"2026.11.19-abc1234"}
+//
+// Several spellings are accepted because they already exist in the
+// wild: `version`/`Version`, `commit`/`Commit`/`sha`/`revision`. A
+// non-string value (a number, an object) is skipped rather than
+// stringified, since a coerced value reads like a real version on the
+// dashboard.
+func versionFromProbeBody(body io.Reader) (version, commit string) {
+	raw, err := io.ReadAll(io.LimitReader(body, maxHealthBody))
+	if err != nil || len(raw) == 0 {
+		return "", ""
+	}
+	var m map[string]any
+	if json.Unmarshal(raw, &m) != nil {
+		return "", ""
+	}
+	pick := func(keys ...string) string {
+		for _, k := range keys {
+			if v, ok := m[k].(string); ok && strings.TrimSpace(v) != "" {
+				return truncate(strings.TrimSpace(v), 120)
+			}
+		}
+		return ""
+	}
+	return pick("version", "Version"), pick("commit", "Commit", "sha", "revision")
 }
 
 // SweepConfig tunes one pass.

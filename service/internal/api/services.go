@@ -50,6 +50,25 @@ type serviceJSON struct {
 	Version     string `json:"version"`
 	Commit      string `json:"commit"`
 	ShortCommit string `json:"short_commit"`
+
+	// VersionSource says where Version came from, so the dashboard can
+	// label it rather than presenting two different facts identically:
+	//
+	//	"deploy" — recorded at registration. What SC deployed.
+	//	"probe"  — read from the service's own health response. What is
+	//	           actually running.
+	//	""       — unknown.
+	//
+	// They can disagree, and that disagreement is the interesting case:
+	// it means a deploy did not replace the running code. Collapsing
+	// them into one unlabelled field would hide exactly the thing an
+	// operator opens this page to find out.
+	VersionSource string `json:"version_source"`
+
+	// LiveVersion is always the probe-reported value when there is one,
+	// even when Version came from the deploy. Lets the UI show the pair
+	// side by side without a second request.
+	LiveVersion string `json:"live_version,omitempty"`
 	DeployedAt  string `json:"deployed_at"`
 	FirstSeenAt string `json:"first_seen_at"`
 	LastSeenAt  string `json:"last_seen_at"`
@@ -165,6 +184,7 @@ func (c *ServicesConfig) List(w http.ResponseWriter, r *http.Request) {
 			if !at.IsZero() {
 				row.HealthAt = at.UTC().Format(time.RFC3339)
 			}
+			applyProbeVersion(&row, latest)
 		}
 		out = append(out, row)
 	}
@@ -360,4 +380,48 @@ func (c *ServicesConfig) Register(w http.ResponseWriter, r *http.Request) {
 		"status":  "ok",
 		"service": toServiceJSON(saved, c.now()),
 	})
+}
+
+// applyProbeVersion overlays what the service reported about itself.
+//
+// Deploy-time version WINS when present — it is the fact about this
+// deploy, and the probe value can lag a cold start or hit an older
+// instance mid-rollout. The probe fills in only what the deploy did not
+// know, which is the common case today: the plugin bus carries no
+// version field, so a consumer passing no build arg registers with
+// Version "".
+//
+// LiveVersion is set unconditionally from the probe, so a UI can show
+// both and make a mismatch visible instead of silently preferring one.
+func applyProbeVersion(row *serviceJSON, latest map[string]registry.HealthResult) {
+	if row.Version != "" {
+		row.VersionSource = "deploy"
+	}
+
+	// Newest probe across regions. Regions can disagree mid-rollout;
+	// the most recent reading is the least stale answer.
+	var newest registry.HealthResult
+	for _, res := range latest {
+		if res.Version == "" && res.Commit == "" {
+			continue
+		}
+		if newest.At.IsZero() || res.At.After(newest.At) {
+			newest = res
+		}
+	}
+	if newest.Version == "" && newest.Commit == "" {
+		return
+	}
+	row.LiveVersion = newest.Version
+
+	if row.Version == "" && newest.Version != "" {
+		row.Version = newest.Version
+		row.VersionSource = "probe"
+	}
+	if row.Commit == "" && newest.Commit != "" {
+		row.Commit = newest.Commit
+		// Reuse the record's own rule so a probe-sourced commit is
+		// displayed exactly like a deploy-sourced one.
+		row.ShortCommit = registry.ServiceRecord{Commit: newest.Commit}.ShortCommit()
+	}
 }

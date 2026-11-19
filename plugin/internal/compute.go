@@ -181,6 +181,16 @@ func (p *Processor) buildRecord(stackName string, input api.ResourceInput, colle
 	// falls back to the component default.
 	if len(clientCfg) > 0 {
 		rec.ClientConfig = SanitizeClientConfig(clientCfg)
+		// The consumer's own public address. Without it the prober has
+		// nothing to probe and the tenant sits at `unknown` forever,
+		// which is how the first real tenant registered.
+		//
+		// Read from the UNSANITIZED config: a hostname is not a
+		// credential, but `domain` would survive sanitization anyway —
+		// taking it from the original keeps this independent of the
+		// redaction rules, so tightening those later cannot silently
+		// break health probing.
+		rec.EndpointURL = EndpointURLFromClientConfig(clientCfg)
 		// The consumer knows where its own probe lives better than a
 		// fleet-wide default does.
 		rec.HealthPath = HealthPathFromClientConfig(clientCfg)

@@ -195,3 +195,59 @@ func TestHasURICredential(t *testing.T) {
 		}
 	}
 }
+
+// TestEndpointURLFromClientConfig covers the field whose absence left
+// the first real tenant unprobeable.
+//
+// forge-storage registered on 2026-11-19 with a correct record and
+// `endpoint_url: ""`, so the health prober had nothing to probe and the
+// service sat at `unknown`. The value was in the captured client config
+// the whole time (`config.domain: storage.simple-forge.com`) — nothing
+// read it.
+func TestEndpointURLFromClientConfig(t *testing.T) {
+	// The normal case: a bare domain becomes an https base.
+	if got := EndpointURLFromClientConfig(map[string]any{
+		"domain": "storage.simple-forge.com",
+	}); got != "https://storage.simple-forge.com" {
+		t.Errorf("domain: got %q", got)
+	}
+
+	// An explicit endpoint wins over domain — for a service whose
+	// public address is not its `domain`.
+	if got := EndpointURLFromClientConfig(map[string]any{
+		"domain":      "internal.example.com",
+		"endpointUrl": "https://public.example.com/",
+	}); got != "https://public.example.com" {
+		t.Errorf("explicit endpoint: got %q", got)
+	}
+
+	// A compose stack nests the domain per service.
+	if got := EndpointURLFromClientConfig(map[string]any{
+		"services": map[string]any{
+			"web": map[string]any{"domain": "baas.simple-forge.com"},
+		},
+	}); got != "https://baas.simple-forge.com" {
+		t.Errorf("compose service domain: got %q", got)
+	}
+
+	// An existing scheme is preserved rather than double-prefixed.
+	if got := EndpointURLFromClientConfig(map[string]any{
+		"domain": "http://legacy.example.com",
+	}); got != "http://legacy.example.com" {
+		t.Errorf("explicit scheme: got %q", got)
+	}
+
+	// Nothing declared returns "", which the prober records as
+	// `unknown` — a wiring gap, not an outage. Returning a guess here
+	// would make a never-probed service look DOWN.
+	for _, cfg := range []map[string]any{
+		nil,
+		{},
+		{"domain": "   "},
+		{"services": map[string]any{"web": map[string]any{"image": "x"}}},
+	} {
+		if got := EndpointURLFromClientConfig(cfg); got != "" {
+			t.Errorf("no endpoint declared (%v): got %q, want empty", cfg, got)
+		}
+	}
+}
