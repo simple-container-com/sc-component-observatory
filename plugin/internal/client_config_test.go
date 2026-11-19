@@ -251,3 +251,77 @@ func TestEndpointURLFromClientConfig(t *testing.T) {
 		}
 	}
 }
+
+// TestEndpointURLFromClientConfig_WrappedDescriptor uses the SHAPE THAT
+// ACTUALLY ARRIVES, not a hand-made flat map.
+//
+// This is the regression that got shipped twice. The first version of
+// EndpointURLFromClientConfig read only the top level, which every
+// hand-written test fixture satisfied — and the live descriptor does
+// not: api packs `stack.Client.Stacks[env]`, so the operator's `domain`
+// sits under a capitalized outer key (an embedded Go field with no json
+// tag) and a lowercase inner one. The fix shipped green and
+// `endpoint_url` was still "" on the live record (forge-storage deploy
+// 44479820610).
+//
+// The fixture below is trimmed from the real captured config served by
+// monitor.simple-forge.com for forge-storage--staging.
+func TestEndpointURLFromClientConfig_WrappedDescriptor(t *testing.T) {
+	live := map[string]any{
+		"type":     "single-image",
+		"template": "lambda",
+		"Config": map[string]any{
+			"config": map[string]any{
+				"baseDnsZone": "simple-forge.com",
+				"domain":      "storage.simple-forge.com",
+				"basePath":    "",
+				"maxMemory":   float64(512),
+				"uses":        []any{"mongodb", "forge-storage", "my-backup", "my-observatory"},
+				"cloudExtras": map[string]any{
+					"lambdaRoutingType": "function-url",
+					"lambdaInvokeMode":  "BUFFERED",
+				},
+			},
+		},
+	}
+
+	if got := EndpointURLFromClientConfig(live); got != "https://storage.simple-forge.com" {
+		t.Fatalf("wrapped descriptor: got %q, want https://storage.simple-forge.com", got)
+	}
+}
+
+// TestFindStringDeep_PrefersShallowest pins the breadth-first ordering.
+//
+// A deep `domain` is usually something else — a key inside an env blob,
+// a policy document, a nested service — so the operator's own top-level
+// value must win. Depth-first would return whichever branch the map
+// iteration happened to walk into, which is non-deterministic in Go and
+// would make this flap between deploys.
+func TestFindStringDeep_PrefersShallowest(t *testing.T) {
+	m := map[string]any{
+		"Config": map[string]any{
+			"config": map[string]any{
+				"domain": "correct.example.com",
+				"env": map[string]any{
+					"domain": "wrong-deeper.example.com",
+				},
+			},
+		},
+	}
+	if got := findStringDeep(m, "domain"); got != "correct.example.com" {
+		t.Errorf("got %q, want the shallowest match", got)
+	}
+}
+
+// TestFindStringDeep_DepthBound stops the search wandering.
+func TestFindStringDeep_DepthBound(t *testing.T) {
+	// 6 levels down — past maxDescriptorDepth, so not found.
+	deep := map[string]any{"a": map[string]any{"b": map[string]any{"c": map[string]any{"d": map[string]any{"e": map[string]any{"domain": "too-deep"}}}}}}
+	if got := findStringDeep(deep, "domain"); got != "" {
+		t.Errorf("past the depth bound: got %q, want empty", got)
+	}
+	// Nil root must not panic.
+	if got := findStringDeep(nil, "domain"); got != "" {
+		t.Errorf("nil root: got %q", got)
+	}
+}
