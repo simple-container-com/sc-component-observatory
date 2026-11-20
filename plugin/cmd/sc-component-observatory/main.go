@@ -242,6 +242,9 @@ func (p *observatoryPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaReques
 				"maxMemory", "timeout",
 				// Component-specific top-level keys.
 				"storage", "metadata", "operatorPassword", "readers",
+				// Which consumer environments may register as tenants.
+				// Empty/absent allows all — the pre-filter behaviour.
+				"tenantEnvironments",
 				// The `op: "scheduler"` token the EventBridge rule
 				// presents on the tick. Scoped to that one route, so the
 				// credential in the rule's input can only fire a sweep.
@@ -422,6 +425,31 @@ func (p *observatoryPlugin) ComputeProcess(stdctx context.Context, req *scplugin
 	}
 	input := runtime.ResourceInputForComputeProcess(req, parent, componentRaw)
 
+	// Environment gate — BEFORE any work, and before anything is sent.
+	//
+	// An SC parent stack can be cloned into short-lived isolated stacks
+	// (the Forge fleet spins one per agent-workflow run). Those blocks
+	// inherit the base config with a YAML merge key, and a merge key
+	// cannot DELETE an inherited entry — so an isolated deploy inherits
+	// `uses: [… my-observatory]` with no way to opt out from the YAML
+	// side. Left alone the dashboard fills with rows for stacks that
+	// were destroyed hours ago, all `health: unknown`, which reads
+	// exactly like real services that stopped answering.
+	//
+	// Skipping is NOT silent: the deploy log says which environment was
+	// refused and what the allowlist is, so an operator who adds a real
+	// environment and forgets to list it finds out from the deploy that
+	// should have registered it, rather than from an empty dashboard
+	// weeks later.
+	consumerEnv := consumerEnvironment(req, parent)
+	if allowed := observatory.TenantEnvironmentsFromConfig(componentRaw); !observatory.EnvMayRegister(allowed, consumerEnv) {
+		p.progress.Info("compute-process", fmt.Sprintf(
+			"skipping tenant registration for %q: environment %q is not in tenantEnvironments %v",
+			req.GetHeader().GetStackName(), consumerEnv, allowed,
+		))
+		return &scpluginv1.ComputeProcessResponse{}, nil
+	}
+
 	// The consuming stack's own client descriptor (api#639). Raw/map
 	// form, not typed: this is FORWARDED to the service rather than
 	// interpreted, and round-tripping through a typed struct would
@@ -517,4 +545,29 @@ func main() {
 			Output: os.Stderr,
 		}),
 	})
+}
+
+// consumerEnvironment resolves the environment the CONSUMER is being
+// deployed to.
+//
+// The header is authoritative. ParentInfo.StackEnv is the fallback for
+// a dispatch shape that leaves the header's env empty, and the stack
+// name's `--<env>` suffix is the last resort — it is what the service
+// itself derives for display, so a value found there is at least
+// consistent with what an operator sees.
+func consumerEnvironment(req *scpluginv1.ComputeProcessRequest, parent *pApi.ParentInfo) string {
+	if e := strings.TrimSpace(req.GetHeader().GetEnvironment()); e != "" {
+		return e
+	}
+	if parent != nil {
+		if e := strings.TrimSpace(parent.StackEnv); e != "" {
+			return e
+		}
+	}
+	if stack := req.GetHeader().GetStackName(); stack != "" {
+		if i := strings.LastIndex(stack, "--"); i >= 0 && i+2 < len(stack) {
+			return stack[i+2:]
+		}
+	}
+	return ""
 }
