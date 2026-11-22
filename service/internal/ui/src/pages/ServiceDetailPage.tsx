@@ -1,6 +1,7 @@
-import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
-import { ArrowLeft, ExternalLink } from "lucide-react";
+import { ArrowLeft, ExternalLink, RefreshCw, Search } from "lucide-react";
 import { api, describeError } from "@/api/client";
 import type { ConfigChange, ConfigDiff, DeployEvent } from "@/api/types";
 import { ErrorBox, HealthBadge, Pill, Spinner, exact, relTime } from "@/components/bits";
@@ -110,24 +111,22 @@ export function ServiceDetailPage() {
 
       <DeployTimeline stack={s.stack} fallback={d.deploys} />
 
-      {/* Logs + metrics are the next slices. Stubbed EXPLICITLY rather
-          than shown as empty panels: an empty chart reads as "no
-          traffic", which is exactly the silent-degradation failure this
-          component is supposed to avoid. */}
-      <div className="grid gap-4 md:grid-cols-2">
-        <Stub
-          title="Logs"
-          ready={s.telemetry_ready}
-          inferred={s.inferred}
-          sources={s.sources.filter((x) => x.kind.includes("log")).map((x) => x.ref)}
-        />
-        <Stub
-          title="Metrics"
-          ready={s.telemetry_ready}
-          inferred={s.inferred}
-          sources={s.sources.filter((x) => !x.kind.includes("log")).map((x) => x.ref)}
-        />
-      </div>
+      <LogsPanel
+        stack={s.stack}
+        inferred={s.inferred}
+        handles={s.sources.filter((x) => x.kind.includes("log")).map((x) => x.ref)}
+      />
+
+      {/* Metrics is the next slice. Stubbed EXPLICITLY rather than shown
+          as an empty chart: an empty chart reads as "no traffic", which
+          is exactly the silent-degradation failure this component is
+          supposed to avoid. */}
+      <Stub
+        title="Metrics"
+        ready={s.telemetry_ready}
+        inferred={s.inferred}
+        sources={s.sources.filter((x) => !x.kind.includes("log")).map((x) => x.ref)}
+      />
 
       {/* Full client config, as deployed. */}
       {s.has_client_config && (
@@ -314,6 +313,235 @@ function Fact({ label, value, mono, title }: { label: string; value: string; mon
       </dd>
     </div>
   );
+}
+
+const WINDOWS: { label: string; minutes: number }[] = [
+  { label: "15m", minutes: 15 },
+  { label: "1h", minutes: 60 },
+  { label: "6h", minutes: 360 },
+  { label: "24h", minutes: 1440 },
+];
+
+const PAGE = 200;
+
+/**
+ * Logs panel.
+ *
+ * Deliberately NOT on a refetch interval, unlike every other query on
+ * this page: each fetch is a real CloudWatch scan with a real bill, and
+ * a dashboard left open on a wall would run one every interval forever.
+ * It fetches on mount (bounded by the short default window), then only
+ * on an explicit search, window change or "load older".
+ *
+ * Search is submit-driven for the same reason — a scan per keystroke is
+ * a scan per keystroke.
+ */
+function LogsPanel({ stack, inferred, handles }: { stack: string; inferred: boolean; handles: string[] }) {
+  const [minutes, setMinutes] = useState(15);
+  const [draft, setDraft] = useState("");
+  const [filter, setFilter] = useState("");
+
+  const q = useInfiniteQuery({
+    queryKey: ["logs", stack, minutes, filter],
+    initialPageParam: null as { cursor: string; start: string; end: string } | null,
+    queryFn: ({ pageParam }) =>
+      api.logs(
+        stack,
+        pageParam
+          ? { q: filter, limit: PAGE, cursor: pageParam.cursor, start: pageParam.start, end: pageParam.end }
+          : { q: filter, limit: PAGE, minutes },
+      ),
+    /* Pages 2..n resend the FIRST page's window verbatim. The cursor
+       moves only the window's end, so using `minutes` again would slide
+       the window forward under the reader between pages and quietly
+       skip whatever was written in between. */
+    getNextPageParam: (last, all) =>
+      last.next_cursor
+        ? { cursor: last.next_cursor, start: all[0].window_start, end: all[0].window_end }
+        : undefined,
+    enabled: handles.length > 0,
+    refetchOnWindowFocus: false,
+  });
+
+  const pages = q.data?.pages ?? [];
+  const first = pages[0];
+  const events = pages.flatMap((p) => p.events);
+  const warnings = Array.from(new Set(pages.flatMap((p) => p.warnings)));
+  const capped = pages.find((p) => p.capped);
+  const scanned = pages.reduce((n, p) => n + p.scanned, 0);
+  const calls = pages.reduce((n, p) => n + p.calls, 0);
+
+  const header = (
+    <div className="flex flex-wrap items-center gap-2">
+      <h2 className="text-sm font-medium">Logs</h2>
+      {inferred && (
+        <Pill tone="warn" title="These handles were guessed from naming conventions, not published by the plugin that owns the resource — so an empty result may be a wrong lookup rather than a quiet service">
+          inferred
+        </Pill>
+      )}
+      {first?.provider && <span className="text-xs text-faint">{first.provider}</span>}
+    </div>
+  );
+
+  // No handles at all: there is nothing to query, and saying so is
+  // different from showing an empty log view.
+  if (handles.length === 0) {
+    return (
+      <div className="card p-4">
+        {header}
+        <p className="mt-2 text-sm text-muted">
+          No log handles are recorded for this service — its template published none and none could be inferred, so
+          there is nothing to query.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="card p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        {header}
+        <div className="flex items-center gap-1">
+          {WINDOWS.map((w) => (
+            <button
+              key={w.minutes}
+              type="button"
+              onClick={() => setMinutes(w.minutes)}
+              className={
+                "rounded px-2 py-1 text-xs " +
+                (w.minutes === minutes ? "bg-accent/15 text-accent" : "text-muted hover:text-fg")
+              }
+            >
+              {w.label}
+            </button>
+          ))}
+          <button
+            type="button"
+            className="btn ml-1 px-2 py-1"
+            onClick={() => void q.refetch()}
+            disabled={q.isFetching}
+            title="Re-run the scan. Not automatic: each run is a real CloudWatch scan."
+          >
+            <RefreshCw className={"h-3.5 w-3.5 " + (q.isFetching ? "animate-spin" : "")} />
+          </button>
+        </div>
+      </div>
+
+      <form
+        className="mt-3 flex gap-2"
+        onSubmit={(e) => {
+          e.preventDefault();
+          setFilter(draft.trim());
+        }}
+      >
+        <input
+          className="input font-mono text-xs"
+          placeholder="Filter pattern — CloudWatch syntax, e.g. ERROR or ?WARN ?ERROR"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+        />
+        <button type="submit" className="btn whitespace-nowrap" disabled={q.isFetching}>
+          <Search className="mr-1 inline h-3.5 w-3.5" />
+          Search
+        </button>
+      </form>
+
+      {/* The window the SERVER searched, not the one this component
+          asked for. They can differ, and the label must be the truth. */}
+      {first && (
+        <p className="mt-2 text-xs text-faint tnum">
+          {exact(first.window_start)} → {exact(first.window_end)} · scanned {scanned.toLocaleString()} event
+          {scanned === 1 ? "" : "s"} in {calls} call{calls === 1 ? "" : "s"}
+          {first.filter ? ` · filter ${first.filter}` : ""}
+        </p>
+      )}
+
+      {q.error && <div className="mt-3"><ErrorBox message={describeError(q.error)} onRetry={() => void q.refetch()} /></div>}
+
+      {/* Load-bearing: "we could not look" must never render as an
+          empty list. */}
+      {first?.unavailable && (
+        <p className="mt-3 rounded border border-warn/40 bg-warn/5 p-2 text-xs text-warn">{first.unavailable}</p>
+      )}
+
+      {capped?.cap_reason && (
+        <p className="mt-3 rounded border border-warn/40 bg-warn/5 p-2 text-xs text-warn">{capped.cap_reason}</p>
+      )}
+
+      {warnings.length > 0 && (
+        <ul className="mt-3 space-y-1">
+          {warnings.map((wn) => (
+            <li key={wn} className="text-xs text-warn">
+              {wn}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {q.isLoading ? (
+        <div className="mt-3"><Spinner label="Scanning…" /></div>
+      ) : events.length === 0 && !first?.unavailable ? (
+        <p className="mt-3 text-sm text-muted">
+          No log lines in this window{first?.filter ? ` matching ${first.filter}` : ""}. The groups searched are listed
+          below — if that is not where this service writes, the handles are wrong.
+        </p>
+      ) : (
+        <ul className="mt-3 max-h-[28rem] divide-y divide-line/40 overflow-auto rounded bg-bg">
+          {events.map((e, i) => (
+            <li key={e.id || `${e.at}-${i}`} className="flex gap-3 px-3 py-1.5 font-mono text-[11px] leading-relaxed">
+              <span className="shrink-0 text-faint tnum" title={exact(e.at)}>
+                {logTime(e.at)}
+              </span>
+              <span className="min-w-0 whitespace-pre-wrap break-words text-muted" title={e.stream || e.source}>
+                {e.message}
+                {e.truncated && (
+                  <span className="ml-1.5 font-sans text-[10px] text-warn" title="Cut at the per-message size cap; the rest of this line is not here">
+                    truncated
+                  </span>
+                )}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {q.hasNextPage ? (
+        <button
+          type="button"
+          className="btn mt-3 w-full"
+          onClick={() => void q.fetchNextPage()}
+          disabled={q.isFetchingNextPage}
+        >
+          {q.isFetchingNextPage ? "Loading…" : "Load older"}
+        </button>
+      ) : events.length > 0 ? (
+        <p className="mt-3 text-xs text-faint">Reached the start of the window.</p>
+      ) : null}
+
+      {/* "Which groups did you search" is the first question when a
+          search comes back empty, so the answer is always one click
+          away rather than only in a server log. */}
+      <details className="mt-3">
+        <summary className="cursor-pointer text-xs text-faint">
+          {first?.queried.length ? `${first.queried.length} log group(s) searched` : `${handles.length} handle(s) recorded`}
+        </summary>
+        <ul className="mt-1 space-y-1">
+          {(first?.queried.length ? first.queried : handles).map((g) => (
+            <li key={g} className="truncate font-mono text-[11px] text-faint" title={g}>
+              {g}
+            </li>
+          ))}
+        </ul>
+      </details>
+    </div>
+  );
+}
+
+/** UTC wall clock to the millisecond — log lines are ordered by it. */
+function logTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toISOString().slice(11, 23) + "Z";
 }
 
 function Stub({ title, ready, inferred, sources }: { title: string; ready: boolean; inferred: boolean; sources: string[] }) {
