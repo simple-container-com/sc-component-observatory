@@ -97,17 +97,21 @@ func NewHTTPProber(timeout time.Duration) *HTTPProber {
 // unhealthy, and retrying a different path would convert a real outage
 // into a green tick.
 // `/api/status` is the third spelling, and it arrived with the first
-// non-Lambda tenants: forge-baas and baas-meeting serve it. They are
-// `cloud-compose` stacks, and a compose stack DOES record its probe
-// path — as the `simple-container.com/healthcheck/path` label inside
-// the docker-compose file, which SC's ECS template reads for the target
-// group. That file is not part of the client descriptor this component
-// receives (the descriptor carries only `dockerComposeFile`, the path
-// to it), so the value is unreachable from here and the spelling has to
-// be tried rather than read. Reading the label properly means the
-// plugin opening the compose file at deploy time and publishing the
-// path with the registration — worth doing, not worth blocking the ECS
-// wiring on.
+// non-Lambda tenants: forge-baas and baas-meeting serve it.
+//
+// Those two should never REACH this list. They are `cloud-compose`
+// stacks, and a compose stack does record its probe path — as the
+// `simple-container.com/healthcheck/path` label on the ingress
+// container, which SC's own ECS template reads to build the target
+// group's health check. The plugin opens the compose file at deploy
+// time and publishes the label with the registration
+// (observatory.ComposeHealthPath), so a compose tenant arrives with a
+// DECLARED path and the fallback chain is skipped entirely.
+//
+// It stays in the list anyway, for the cases where that read cannot
+// happen: a compose file with several unlabelled services, a registration
+// written by an older plugin, or a relative `dockerComposeFile` path.
+// Those degrade to a guess rather than to `down`.
 var FallbackPaths = []string{"/health", "/api/status"}
 
 func (p *HTTPProber) Probe(ctx context.Context, url string) registry.HealthResult {

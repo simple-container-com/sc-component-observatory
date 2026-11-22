@@ -4,6 +4,7 @@
 package observatory
 
 import (
+	"context"
 	"testing"
 
 	"github.com/simple-container-com/api/pkg/api"
@@ -144,7 +145,7 @@ func TestDeriveTemplate_ReadsTheConsumerNotTheComponent(t *testing.T) {
 	if got := bare.deriveTemplate(nil); got != "" {
 		t.Errorf("without a client descriptor: deriveTemplate = %q, want empty", got)
 	}
-	if rec := bare.buildRecord("forge-baas--staging", api.ResourceInput{Descriptor: own},
+	if rec := bare.buildRecord(context.Background(), "forge-baas--staging", api.ResourceInput{Descriptor: own},
 		collectorWith(nil), nil, []byte("k")); rec.Template != "" || rec.Cloud != "" || len(rec.Sources) != 0 {
 		t.Errorf("record built from the component's own config: %+v", rec)
 	}
@@ -156,7 +157,7 @@ func TestDeriveTemplate_ReadsTheConsumerNotTheComponent(t *testing.T) {
 // ECS names.
 func TestBuildRecord_ECSConsumerGetsECSHandles(t *testing.T) {
 	p := NewProcessor(ProcessorConfig{ClientConfig: composeDescriptor()})
-	rec := p.buildRecord("forge-baas--staging", api.ResourceInput{},
+	rec := p.buildRecord(context.Background(), "forge-baas--staging", api.ResourceInput{},
 		collectorWith(nil), composeDescriptor(), []byte("fp-key"))
 
 	if rec.Template != "ecs-fargate" || rec.Cloud != CloudAWS {
