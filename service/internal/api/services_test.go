@@ -183,9 +183,15 @@ func TestList_ShapeIsSpreadSafe(t *testing.T) {
 	cfg, _ := newCfg()
 	m := mux(cfg)
 	// A service with NO sources — the dangerous case.
+	//
+	// The template has to be one with no derivable naming convention:
+	// the list handler re-derives handles for a `lambda`
+	// (registry.WithDerivedSources), so a lambda with no stored sources
+	// is no longer source-less by the time it reaches the wire.
+	bare := registerBody("bare--staging", "v1", false)
+	bare["template"] = "yc-container"
 	if rr := do(t, m, "POST", "/api/v1/services/register",
-		jwtFor(t, "register", "bare--staging"),
-		registerBody("bare--staging", "v1", false)); rr.Code != http.StatusOK {
+		jwtFor(t, "register", "bare--staging"), bare); rr.Code != http.StatusOK {
 		t.Fatalf("seed: %d", rr.Code)
 	}
 

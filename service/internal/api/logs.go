@@ -144,6 +144,11 @@ func (c *LogsConfig) Logs(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "service not registered")
 		return
 	}
+	// Re-derive inferred handles from this build's conventions rather
+	// than querying the guess frozen into the record at registration
+	// time. See registry.WithDerivedSources — a wrong convention is then
+	// fixed by deploying observatory, not by redeploying every tenant.
+	rec = registry.WithDerivedSources(rec)
 
 	start, end, err := c.window(r)
 	if err != nil {
