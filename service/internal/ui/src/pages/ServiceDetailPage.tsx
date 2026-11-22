@@ -3,7 +3,7 @@ import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import { ArrowLeft, ChevronRight, ExternalLink, RefreshCw, Search } from "lucide-react";
 import { api, describeError } from "@/api/client";
-import type { ConfigChange, ConfigDiff, DeployEvent } from "@/api/types";
+import type { ConfigChange, ConfigDiff, DeployEvent, MetricSeries } from "@/api/types";
 import { ErrorBox, HealthBadge, Pill, Spinner, exact, relTime } from "@/components/bits";
 
 export function ServiceDetailPage() {
@@ -117,15 +117,15 @@ export function ServiceDetailPage() {
         handles={s.sources.filter((x) => x.kind.includes("log")).map((x) => x.ref)}
       />
 
-      {/* Metrics is the next slice. Stubbed EXPLICITLY rather than shown
-          as an empty chart: an empty chart reads as "no traffic", which
-          is exactly the silent-degradation failure this component is
-          supposed to avoid. */}
-      <Stub
-        title="Metrics"
-        ready={s.telemetry_ready}
+      <MetricsPanel
+        stack={s.stack}
         inferred={s.inferred}
-        sources={s.sources.filter((x) => !x.kind.includes("log")).map((x) => x.ref)}
+        /* Cosmetic only — used for the "nothing to query" message and
+           until a query has run. The BACKEND decides which handles it
+           reads (by source kind), and its `queried` list replaces this
+           one as soon as there is a response, so the SPA never has to
+           stay in step with the registry's kind vocabulary. */
+        handles={s.sources.filter((x) => x.kind.includes("metric")).map((x) => x.ref)}
       />
 
       {/* Full client config, as deployed. */}
@@ -655,35 +655,425 @@ function logTime(iso: string): string {
   return d.toISOString().slice(11, 23) + "Z";
 }
 
-function Stub({ title, ready, inferred, sources }: { title: string; ready: boolean; inferred: boolean; sources: string[] }) {
+/**
+ * Metric windows. Wider than the log windows on purpose: a metric read
+ * costs a fixed handful of API calls whatever the window, so the reason
+ * to keep log windows short (scan volume) does not apply, and three
+ * hours is the narrowest window in which a 1-minute series has a shape.
+ *
+ * 30d is the backend's default ceiling. The provider will RAISE the
+ * period past 15 days (CloudWatch stops keeping 1-minute resolution),
+ * and the panel reports that rather than silently drawing a coarser
+ * line.
+ */
+const METRIC_WINDOWS: { label: string; minutes: number }[] = [
+  { label: "1h", minutes: 60 },
+  { label: "3h", minutes: 180 },
+  { label: "24h", minutes: 1440 },
+  { label: "7d", minutes: 7 * 1440 },
+  { label: "30d", minutes: 30 * 1440 },
+];
+
+/**
+ * Metrics panel.
+ *
+ * Renders whatever series the backend hands it — no metric name, unit or
+ * statistic is known here. That is the whole point: the catalogue lives
+ * in the provider (`internal/telemetry/awsprov/metrics.go`), so adding
+ * ECS, YC or k8s metrics is a table on the Go side and no change in this
+ * file.
+ *
+ * Collapsible and query-disabled while collapsed, like the deploy
+ * timeline — each expansion is a real CloudWatch read. Not on a refetch
+ * interval, like the logs panel, for the same reason.
+ */
+function MetricsPanel({ stack, inferred, handles }: { stack: string; inferred: boolean; handles: string[] }) {
+  const [open, setOpen] = useCollapsed("obs.metrics.open", true);
+  const [minutes, setMinutes] = useState(180);
+
+  const q = useQuery({
+    queryKey: ["metrics", stack, minutes],
+    queryFn: () => api.metrics(stack, { minutes }),
+    enabled: open && handles.length > 0,
+    refetchOnWindowFocus: false,
+  });
+
+  const res = q.data;
+  const drawn = res?.series.filter((s) => !s.absent) ?? [];
+  const absent = res?.series.filter((s) => s.absent) ?? [];
+
+  const header = (
+    <>
+      <ChevronRight className={"h-3.5 w-3.5 shrink-0 text-faint transition-transform " + (open ? "rotate-90" : "")} />
+      <h2 className="text-sm font-medium">Metrics</h2>
+      {inferred && (
+        <Pill
+          tone="warn"
+          title="These handles were guessed from naming conventions, not published by the plugin that owns the resource — so a metric that resolves to nothing may be a wrong lookup rather than an idle workload"
+        >
+          inferred
+        </Pill>
+      )}
+      {res?.provider && <span className="text-xs text-faint">{res.provider}</span>}
+      {open && q.isFetching && <span className="text-xs text-faint">reading…</span>}
+    </>
+  );
+
+  // Nothing to query. Said in words, because an empty chart grid reads
+  // as "no traffic" — the exact confusion this component exists to
+  // prevent.
+  if (handles.length === 0) {
+    return (
+      <div className="card p-4">
+        <div className="flex items-center gap-2">{header}</div>
+        <p className="mt-2 text-sm text-muted">
+          No metric handles are recorded for this service — its template published none and none could be inferred, so
+          there is nothing to query.
+        </p>
+      </div>
+    );
+  }
+
   return (
     <div className="card p-4">
-      <div className="flex items-center gap-2">
-        <h2 className="text-sm font-medium">{title}</h2>
-        {inferred && (
-          <Pill tone="warn" title="These handles were guessed from naming conventions, not published by the plugin that owns the resource">
-            inferred
-          </Pill>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <button
+          type="button"
+          className="flex flex-1 items-center gap-2 text-left"
+          onClick={() => setOpen(!open)}
+          aria-expanded={open}
+        >
+          {header}
+        </button>
+        {open && (
+          <div className="flex items-center gap-1">
+            {METRIC_WINDOWS.map((w) => (
+              <button
+                key={w.minutes}
+                type="button"
+                onClick={() => setMinutes(w.minutes)}
+                className={
+                  "rounded px-2 py-1 text-xs " +
+                  (w.minutes === minutes ? "bg-accent/15 text-accent" : "text-muted hover:text-fg")
+                }
+              >
+                {w.label}
+              </button>
+            ))}
+            <button
+              type="button"
+              className="btn ml-1 px-2 py-1"
+              onClick={() => void q.refetch()}
+              disabled={q.isFetching}
+              title="Re-read. Not automatic: each read is a real CloudWatch query."
+            >
+              <RefreshCw className={"h-3.5 w-3.5 " + (q.isFetching ? "animate-spin" : "")} />
+            </button>
+          </div>
         )}
       </div>
-      {!ready ? (
-        <p className="mt-2 text-sm text-muted">
-          No telemetry handles for this service — nothing to query. Its template did not publish any and none could be
-          derived.
-        </p>
-      ) : (
+
+      {!open ? null : (
         <>
-          <p className="mt-2 text-sm text-muted">Query UI lands in a later slice. Handles discovered:</p>
-          <ul className="mt-2 space-y-1">
-            {sources.length === 0 && <li className="text-xs text-faint">none of this kind</li>}
-            {sources.map((ref) => (
-              <li key={ref} className="truncate font-mono text-xs text-faint" title={ref}>
-                {ref}
-              </li>
-            ))}
-          </ul>
+          {/* The window and bucket the SERVER used, not the ones this
+              panel asked for. They differ whenever the period was
+              raised, and the label must be the truth. */}
+          {res && (
+            <p className="mt-2 text-xs text-faint tnum">
+              {exact(res.window_start)} → {exact(res.window_end)} · {describePeriod(res.period_seconds)} ·{" "}
+              {res.queried.length} target{res.queried.length === 1 ? "" : "s"} in {res.calls} call
+              {res.calls === 1 ? "" : "s"}
+            </p>
+          )}
+
+          {q.error && (
+            <div className="mt-3">
+              <ErrorBox message={describeError(q.error)} onRetry={() => void q.refetch()} />
+            </div>
+          )}
+
+          {/* Load-bearing: "we could not look" must never render as a
+              set of empty charts. */}
+          {res?.unavailable && (
+            <p className="mt-3 rounded border border-warn/40 bg-warn/5 p-2 text-xs text-warn">{res.unavailable}</p>
+          )}
+
+          {/* A raised period is not a failure, but it IS a different
+              chart from the one that was asked for: 5-minute buckets
+              flatten a spike a 1-minute series would show. */}
+          {res?.adjusted && res.adjust_reason && (
+            <p className="mt-3 rounded border border-line bg-bg p-2 text-xs text-muted">{res.adjust_reason}</p>
+          )}
+
+          {res?.capped && res.cap_reason && (
+            <p className="mt-3 rounded border border-warn/40 bg-warn/5 p-2 text-xs text-warn">{res.cap_reason}</p>
+          )}
+
+          {res && res.warnings.length > 0 && (
+            <ul className="mt-3 space-y-1">
+              {res.warnings.map((wn) => (
+                <li key={wn} className="text-xs text-warn">
+                  {wn}
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {q.isLoading ? (
+            <div className="mt-3">
+              <Spinner label="Reading metrics…" />
+            </div>
+          ) : !res ? null : (
+            <>
+              {drawn.length > 0 && (
+                <div className="mt-3 grid gap-3 md:grid-cols-2">
+                  {drawn.map((s) => (
+                    <MetricChart
+                      key={`${s.name}|${s.label ?? ""}`}
+                      series={s}
+                      start={res.window_start}
+                      end={res.window_end}
+                      periodSeconds={res.period_seconds}
+                    />
+                  ))}
+                </div>
+              )}
+
+              {/* An absent metric is listed, never omitted and never
+                  drawn as a flat line at zero: "this workload has no
+                  such metric" and "it reported nothing" are different
+                  answers, and `ListMetrics` is called to tell them
+                  apart. */}
+              {absent.length > 0 && (
+                <ul className="mt-3 space-y-1">
+                  {absent.map((s) => (
+                    <li key={`${s.name}|${s.label ?? ""}`} className="text-xs text-faint">
+                      <span className="font-mono text-muted">{s.label || s.name}</span> — {s.reason || "not available"}
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              {drawn.length === 0 && absent.length === 0 && !res.unavailable && (
+                <p className="mt-3 text-sm text-muted">
+                  No series came back for this window. The targets queried are listed below — if that is not this
+                  service's workload, the handles are wrong.
+                </p>
+              )}
+            </>
+          )}
+
+          {/* "What did you actually chart" is the first question when a
+              chart looks wrong, so the answer is one click away. */}
+          <details className="mt-3">
+            <summary className="cursor-pointer text-xs text-faint">
+              {res?.queried.length
+                ? `${res.queried.length} target(s) charted`
+                : `${handles.length} handle(s) recorded`}
+            </summary>
+            <ul className="mt-1 space-y-1">
+              {(res?.queried.length ? res.queried : handles).map((t) => (
+                <li key={t} className="truncate font-mono text-[11px] text-faint" title={t}>
+                  {t}
+                </li>
+              ))}
+            </ul>
+          </details>
         </>
       )}
     </div>
   );
+}
+
+/** Chart geometry. A viewBox, scaled by CSS — no measuring, no resize observer. */
+const CHART_W = 600;
+const CHART_H = 120;
+
+/**
+ * One series as an area chart.
+ *
+ * Hand-rolled SVG rather than a charting library: the whole panel is
+ * five small sparklines whose only hard requirement is that they do not
+ * lie, and a dependency would be an architectural decision for a
+ * 40-line path builder.
+ *
+ * Two honesty rules are built into the geometry:
+ *
+ *  - X is TIME, not point index. Buckets with no data are omitted by
+ *    CloudWatch, so index-positioning would compress a gap away and
+ *    draw a continuous line over a period of silence.
+ *  - A gap wider than two buckets BREAKS the line instead of
+ *    interpolating across it. An interpolated segment over missing data
+ *    is indistinguishable from real data, which is the same failure as
+ *    an empty chart reading as zero traffic.
+ */
+function MetricChart({
+  series,
+  start,
+  end,
+  periodSeconds,
+}: {
+  series: MetricSeries;
+  start: string;
+  end: string;
+  periodSeconds: number;
+}) {
+  const t0 = Date.parse(start);
+  const t1 = Date.parse(end);
+  const pts = series.points
+    .map((p) => ({ t: Date.parse(p.at), v: p.value }))
+    .filter((p) => Number.isFinite(p.t) && Number.isFinite(p.v))
+    .sort((a, b) => a.t - b.t);
+
+  const values = pts.map((p) => p.v);
+  const peak = values.length ? Math.max(...values) : 0;
+  const total = values.reduce((a, b) => a + b, 0);
+  const last = values.length ? values[values.length - 1] : undefined;
+
+  // Zero-based on purpose: for a counter a non-zero baseline invents a
+  // trend, and for a latency it exaggerates noise into a cliff.
+  const top = peak > 0 ? peak : 1;
+  const span = Math.max(t1 - t0, 1);
+  const x = (t: number) => ((t - t0) / span) * CHART_W;
+  const y = (v: number) => CHART_H - (v / top) * (CHART_H - 4) - 2;
+
+  // Break the line across gaps wider than two buckets.
+  const maxGap = Math.max(periodSeconds, 60) * 2000;
+  const runs: { t: number; v: number }[][] = [];
+  for (const p of pts) {
+    const run = runs[runs.length - 1];
+    if (!run || p.t - run[run.length - 1].t > maxGap) runs.push([p]);
+    else run.push(p);
+  }
+
+  return (
+    <div className="rounded border border-line bg-bg p-3">
+      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+        <span className="font-mono text-xs text-fg" title={series.label || series.name}>
+          {series.name}
+        </span>
+        {series.stat && (
+          <span className="text-[10px] text-faint" title="The statistic this series was aggregated with">
+            {series.stat.toLowerCase()}
+          </span>
+        )}
+        <span className="ml-auto text-xs text-muted tnum">{summarize(series, { peak, total, last })}</span>
+      </div>
+
+      {pts.length === 0 ? (
+        /* Exists, reported nothing. Said in words — a flat line at zero
+           would claim a measurement that was never taken. */
+        <p className="mt-2 text-xs text-faint">{series.reason || "no data points in this window"}</p>
+      ) : (
+        <svg
+          viewBox={`0 0 ${CHART_W} ${CHART_H}`}
+          preserveAspectRatio="none"
+          className="mt-2 h-20 w-full"
+          role="img"
+          aria-label={`${series.name} over the selected window`}
+        >
+          {/* Mid gridline, labelled by the header's peak — enough to read
+              a magnitude off the shape without a full axis. */}
+          <line x1="0" y1={y(top / 2)} x2={CHART_W} y2={y(top / 2)} className="stroke-line" strokeWidth="1" />
+          {runs.map((run, i) => {
+            const line = run.map((p) => `${x(p.t).toFixed(1)},${y(p.v).toFixed(1)}`).join(" L");
+            const area =
+              `M${x(run[0].t).toFixed(1)},${CHART_H} L` +
+              line +
+              ` L${x(run[run.length - 1].t).toFixed(1)},${CHART_H} Z`;
+            return (
+              <g key={i}>
+                <path d={area} className="fill-accent/15" />
+                <path
+                  d={`M${line}`}
+                  className="stroke-accent"
+                  strokeWidth="1.5"
+                  fill="none"
+                  vectorEffect="non-scaling-stroke"
+                />
+                {/* A single-point run has no line to draw. */}
+                {run.length === 1 && <circle cx={x(run[0].t)} cy={y(run[0].v)} r="2" className="fill-accent" />}
+              </g>
+            );
+          })}
+        </svg>
+      )}
+
+      <div className="mt-1 flex justify-between text-[10px] text-faint tnum">
+        <span title={exact(start)}>{clock(start)}</span>
+        <span>
+          peak {fmtValue(peak, series.unit)}
+          {/* Gaps are worth naming when a mostly-continuous line has
+              holes in it. For a sparse counter — one isolated point
+              per incident — every point is its own run, and counting
+              those as gaps says nothing the dots do not already show. */}
+          {runs.length > 1 && pts.length >= runs.length * 2
+            ? ` · ${runs.length - 1} gap${runs.length === 2 ? "" : "s"}`
+            : ""}
+        </span>
+        <span title={exact(end)}>{clock(end)}</span>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The one number worth putting next to the chart, chosen by the
+ * statistic: a counter's total, a latency's peak-and-last, a ceiling's
+ * peak. Driven by `stat` rather than by metric name, so it works for
+ * metrics this build has never heard of.
+ */
+function summarize(
+  s: MetricSeries,
+  agg: { peak: number; total: number; last?: number },
+): string {
+  if (agg.last === undefined) return "—";
+  switch ((s.stat || "").toLowerCase()) {
+    case "sum":
+      return `${fmtValue(agg.total, s.unit)} total`;
+    case "maximum":
+      return `${fmtValue(agg.peak, s.unit)} peak`;
+    default:
+      return `${fmtValue(agg.last, s.unit)} latest`;
+  }
+}
+
+/** Unit-aware value formatting. Unknown units fall through to a plain number. */
+function fmtValue(v: number, unit?: string): string {
+  switch (unit) {
+    case "Milliseconds":
+      return v >= 1000 ? `${round(v / 1000)} s` : `${round(v)} ms`;
+    case "Seconds":
+      return v < 1 ? `${round(v * 1000)} ms` : `${round(v)} s`;
+    case "Percent":
+      return `${round(v)}%`;
+    case "Bytes":
+      return v >= 1 << 20 ? `${round(v / (1 << 20))} MiB` : v >= 1024 ? `${round(v / 1024)} KiB` : `${round(v)} B`;
+    default:
+      return round(v).toLocaleString();
+  }
+}
+
+/** Two significant-ish digits: metric values span counts and milliseconds. */
+function round(v: number): number {
+  const a = Math.abs(v);
+  if (a >= 100) return Math.round(v);
+  if (a >= 10) return Math.round(v * 10) / 10;
+  return Math.round(v * 100) / 100;
+}
+
+/** HH:MM in the reader's own zone — the axis is read against a wall clock. */
+function clock(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+/** "1-minute buckets" — the period the provider actually used. */
+function describePeriod(seconds: number): string {
+  if (!seconds) return "period unknown";
+  if (seconds % 86400 === 0) return `${seconds / 86400}-day buckets`;
+  if (seconds % 3600 === 0) return `${seconds / 3600}-hour buckets`;
+  if (seconds % 60 === 0) return `${seconds / 60}-minute buckets`;
+  return `${seconds}-second buckets`;
 }

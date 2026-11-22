@@ -3,15 +3,18 @@
 
 // Package awsprov is the AWS implementation of telemetry.Provider.
 //
-// Slice 2a serves logs only, from CloudWatch Logs `FilterLogEvents` —
-// inline, paginated and scan-capped. Insights (`StartQuery`) is
-// deliberately absent: it bills per GB scanned and its results arrive
+// Logs come from CloudWatch Logs `FilterLogEvents` — inline, paginated
+// and scan-capped (this file). Insights (`StartQuery`) is deliberately
+// absent: it bills per GB scanned and its results arrive
 // asynchronously, which needs a dispatched worker and a second
 // deployable (design decision D2). A dashboard panel that can quietly
 // bill is worse than one that cannot answer every question.
 //
-// Metrics and Workloads are declared and refuse honestly until slices
-// 3 and 3.5.
+// Metrics come from `GetMetricData`, with `ListMetrics` first so that
+// "this workload has no such metric" is distinguishable from "it
+// reported nothing" — see metrics.go.
+//
+// Workloads is declared and refuses honestly until slice 3.5.
 package awsprov
 
 import (
@@ -85,18 +88,32 @@ type Config struct {
 type Provider struct {
 	cfg Config
 
-	// clientFor is swapped in tests. Keyed by region because log groups
-	// and metrics are per-region and a multi-region service is normal.
-	clientFor func(ctx context.Context, region string) (cwAPI, error)
+	// clientFor / metricClientFor are swapped in tests. Keyed by region
+	// because log groups and metrics are per-region and a multi-region
+	// service is normal.
+	//
+	// Two clients rather than one: CloudWatch Logs and CloudWatch
+	// Metrics are separate AWS services with separate SDK packages and
+	// separate IAM actions, and conflating them would make a logs-only
+	// grant look like a broken metrics implementation.
+	clientFor       func(ctx context.Context, region string) (cwAPI, error)
+	metricClientFor func(ctx context.Context, region string) (cwmAPI, error)
 
-	mu      sync.Mutex
-	clients map[string]cwAPI
-	groups  map[string]groupCacheEntry
+	mu       sync.Mutex
+	clients  map[string]cwAPI
+	mclients map[string]cwmAPI
+	groups   map[string]groupCacheEntry
+	metrics  map[string]metricCacheEntry
 }
 
 type groupCacheEntry struct {
 	groups []string
 	at     time.Time
+}
+
+type metricCacheEntry struct {
+	targets []listedTarget
+	at      time.Time
 }
 
 // Defaults chosen to make capping rare rather than to make it
@@ -165,11 +182,14 @@ func New(ctx context.Context, cfg Config) (*Provider, error) {
 		cfg.GroupCacheTTL = defaultGroupCacheTTL
 	}
 	p := &Provider{
-		cfg:     cfg,
-		clients: map[string]cwAPI{},
-		groups:  map[string]groupCacheEntry{},
+		cfg:      cfg,
+		clients:  map[string]cwAPI{},
+		mclients: map[string]cwmAPI{},
+		groups:   map[string]groupCacheEntry{},
+		metrics:  map[string]metricCacheEntry{},
 	}
 	p.clientFor = p.realClient
+	p.metricClientFor = p.realMetricClient
 	// Touch ctx so the signature stays honest about doing I/O later and
 	// callers keep passing a cancellable context in.
 	_ = ctx
@@ -185,15 +205,11 @@ func (p *Provider) now() time.Time {
 
 func (p *Provider) Name() string { return registry.CloudAWS }
 
-// Capabilities reports logs only. Metrics and Workloads are wired into
-// the interface but refuse — so the dashboard says "not implemented
-// yet" instead of drawing an empty chart.
+// Capabilities reports logs and metrics. Workloads is wired into the
+// interface but refuses — so the dashboard says "not implemented yet"
+// instead of drawing a replica count of zero.
 func (p *Provider) Capabilities() telemetry.Capabilities {
-	return telemetry.Capabilities{Logs: true, Metrics: false, Workloads: false}
-}
-
-func (p *Provider) Metrics(context.Context, telemetry.MetricQuery) ([]telemetry.Series, error) {
-	return nil, telemetry.Unsupported("the AWS provider", "metrics")
+	return telemetry.Capabilities{Logs: true, Metrics: true, Workloads: false}
 }
 
 func (p *Provider) Workloads(context.Context, telemetry.WorkloadQuery) ([]telemetry.Workload, error) {

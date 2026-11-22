@@ -65,8 +65,8 @@ func (f *fakeProvider) Logs(_ context.Context, q telemetry.LogQuery) (telemetry.
 	return f.page, f.err
 }
 
-func (f *fakeProvider) Metrics(context.Context, telemetry.MetricQuery) ([]telemetry.Series, error) {
-	return nil, telemetry.Unsupported(f.name, "metrics")
+func (f *fakeProvider) Metrics(context.Context, telemetry.MetricQuery) (telemetry.MetricResult, error) {
+	return telemetry.MetricResult{}, telemetry.Unsupported(f.name, "metrics")
 }
 
 func (f *fakeProvider) Workloads(context.Context, telemetry.WorkloadQuery) ([]telemetry.Workload, error) {

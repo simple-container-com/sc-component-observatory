@@ -2,6 +2,8 @@ import type {
   DeploysResponse,
   LogsQuery,
   LogsResponse,
+  MetricsQuery,
+  MetricsResponse,
   ServiceDetail,
   ServicesResponse,
   SessionInfo,
@@ -91,6 +93,29 @@ export const api = {
     return request<LogsResponse>(
       "GET",
       `/api/v1/services/${encodeURIComponent(stack)}/logs${qs ? `?${qs}` : ""}`,
+    );
+  },
+  /**
+   * Metric series for one service.
+   *
+   * Like `logs`, never called on a timer: each call is a real
+   * `ListMetrics` + `GetMetricData` pair against CloudWatch. Unlike
+   * logs it is NOT paged — the window and the period together bound the
+   * response, and the provider lowers the resolution rather than
+   * returning more points.
+   */
+  metrics: (stack: string, query: MetricsQuery = {}) => {
+    const p = new URLSearchParams();
+    if (query.minutes) p.set("minutes", String(query.minutes));
+    if (query.start) p.set("start", query.start);
+    if (query.end) p.set("end", query.end);
+    if (query.period) p.set("period", String(query.period));
+    if (query.stat) p.set("stat", query.stat);
+    if (query.names?.length) p.set("names", query.names.join(","));
+    const qs = p.toString();
+    return request<MetricsResponse>(
+      "GET",
+      `/api/v1/services/${encodeURIComponent(stack)}/metrics${qs ? `?${qs}` : ""}`,
     );
   },
   removeService: (stack: string) =>

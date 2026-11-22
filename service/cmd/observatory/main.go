@@ -179,9 +179,15 @@ func run() error {
 	// Telemetry. One provider per cloud, selected per service by the
 	// `cloud` its record carries; a cloud with no provider answers with
 	// a reason, never with an empty page.
+	// One Set shared by both handlers, so the per-region clients and the
+	// prefix-resolution caches are shared too: logs and metrics resolve
+	// the same deploy's resources, and a second copy would double both
+	// the discovery calls and the chance of the two panels disagreeing
+	// about which function they are looking at.
+	providers := buildProviders(ctx)
 	logsCfg := &api.LogsConfig{
 		Registry:      reg,
-		Providers:     buildProviders(ctx),
+		Providers:     providers,
 		DefaultWindow: time.Duration(envInt("LOGS_DEFAULT_WINDOW_MINUTES", 15)) * time.Minute,
 		MaxWindow:     time.Duration(envInt("LOGS_MAX_WINDOW_HOURS", 48)) * time.Hour,
 		DefaultLimit:  envInt("LOGS_PAGE_LIMIT", 200),
@@ -196,6 +202,17 @@ func run() error {
 		},
 	}
 	mux.Handle("GET /api/v1/services/{stack}/logs", auth(http.HandlerFunc(logsCfg.Logs)))
+
+	metricsCfg := &api.MetricsConfig{
+		Registry:      reg,
+		Providers:     providers,
+		DefaultWindow: time.Duration(envInt("METRICS_DEFAULT_WINDOW_MINUTES", 180)) * time.Minute,
+		MaxWindow:     time.Duration(envInt("METRICS_MAX_WINDOW_DAYS", 30)) * 24 * time.Hour,
+		// Zero leaves the provider's own fan-out cap in place; the safe
+		// direction for an operator override is down.
+		MaxSeries: envInt("METRICS_MAX_SERIES", 0),
+	}
+	mux.Handle("GET /api/v1/services/{stack}/metrics", auth(http.HandlerFunc(metricsCfg.Metrics)))
 
 	// Embedded SPA last, on the catch-all, so it cannot shadow an API
 	// route. A missing dist is a warning rather than a failure: a

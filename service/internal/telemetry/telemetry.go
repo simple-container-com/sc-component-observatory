@@ -57,8 +57,10 @@ type Provider interface {
 	// Logs returns one page of log events for a service's sources.
 	Logs(ctx context.Context, q LogQuery) (LogPage, error)
 
-	// Metrics returns time series for the requested metric names.
-	Metrics(ctx context.Context, q MetricQuery) ([]Series, error)
+	// Metrics returns time series for the requested metric names,
+	// alongside the query that was ACTUALLY run — see MetricResult for
+	// why the two can differ.
+	Metrics(ctx context.Context, q MetricQuery) (MetricResult, error)
 
 	// Workloads is what is RUNNING — replica counts, memory and CPU
 	// allotments, concurrency limits. Separate from the declared
@@ -185,24 +187,109 @@ type LogPage struct {
 	Warnings []string `json:"warnings"`
 }
 
-// MetricQuery / Series / WorkloadQuery / Workload are declared now and
-// served in slices 3 and 3.5. They are here rather than in a later
-// commit because the interface is the contract the SPA is written
-// against, and discovering a missing field after two cloud
-// implementations exist means changing both.
+// MetricQuery asks for a service's series over a window.
+//
+// WorkloadQuery / Workload below are still declared-not-served (slice
+// 3.5). They are here rather than in a later commit because the
+// interface is the contract the SPA is written against, and discovering
+// a missing field after two cloud implementations exist means changing
+// both.
 type MetricQuery struct {
-	Sources    []registry.TelemetrySource
-	Names      []string
+	Sources []registry.TelemetrySource
+
+	// Names selects metrics. EMPTY MEANS THE PROVIDER'S DEFAULT
+	// CATALOGUE for whatever namespaces the sources name — not "all
+	// metrics". "All" is unbounded (a shared ECS cluster publishes
+	// hundreds) and, worse, unlabelled: the SPA has no way to order or
+	// explain a list it did not ask for. The catalogue is per-namespace
+	// and lives in the provider, so the SPA never learns a cloud's
+	// metric names.
+	Names []string
+
 	Start, End time.Time
-	// Period is the aggregation bucket.
+
+	// Period is the aggregation bucket. Zero means "choose one from the
+	// window", which is the normal case — a caller that picks its own
+	// period will eventually pick one the cloud refuses to serve.
 	Period time.Duration
-	Stat   string
+
+	// Stat overrides the per-metric default statistic. Normally empty:
+	// Sum is right for Invocations and nonsense for Duration, so the
+	// catalogue carries a statistic per metric and a caller that sets
+	// one flat value here is usually asking for a wrong chart.
+	Stat string
+
+	// MaxSeries caps how many series one request may fetch. Zero means
+	// the provider's default.
+	MaxSeries int
+}
+
+// MetricResult is the series plus a description of the query that was
+// actually run.
+//
+// The second half is not bookkeeping. Every cloud silently rewrites a
+// metric query it cannot serve as asked — CloudWatch keeps 1-minute
+// resolution for 15 days and 5-minute for 63, and a finer period over
+// an older window returns an EMPTY RESULT rather than an error. A
+// dashboard that echoed the period it asked for would then draw a blank
+// chart labelled with a resolution the data never had. So the period
+// that ran, the statistic that ran, and any adjustment are part of the
+// answer.
+type MetricResult struct {
+	// Series is NEVER nil, and a requested metric always appears —
+	// flagged Absent with a Reason when the cloud has no such metric
+	// for this workload. Dropping it would make "this workload never
+	// emitted Errors" look identical to "it emitted no errors".
+	Series []Series `json:"series"`
+
+	// PeriodSeconds and Stat are what RAN, not what was asked for.
+	PeriodSeconds int    `json:"period_seconds"`
+	Stat          string `json:"stat,omitempty"`
+
+	// Queried names the concrete targets read — a prefix handle
+	// resolves to real resource names, and "which function did you
+	// chart" is the first question when a number looks wrong.
+	Queried []string `json:"queried"`
+
+	// Warnings are per-source failures that did not sink the query.
+	// Never nil.
+	Warnings []string `json:"warnings"`
+
+	// Capped means MaxSeries stopped the fan-out before every
+	// (metric × target) pair was fetched. CapReason says what was left
+	// out, because a chart silently missing one of three functions is
+	// the dashboard reporting a partial sum as a total.
+	Capped    bool   `json:"capped"`
+	CapReason string `json:"cap_reason,omitempty"`
+
+	// Adjusted means the query that ran differs from the one asked for
+	// — today always the period, raised to what the cloud still keeps
+	// at that age. Reported out loud for the reason in the type
+	// comment: the alternative is a correct-looking empty chart.
+	Adjusted     bool   `json:"adjusted"`
+	AdjustReason string `json:"adjust_reason,omitempty"`
+
+	// Calls is what the query cost in API round trips, same contract as
+	// LogPage.Calls.
+	Calls int `json:"calls"`
 }
 
 // Series is one named time series. Points are ascending by time.
 type Series struct {
-	Name   string            `json:"name"`
-	Unit   string            `json:"unit,omitempty"`
+	Name string `json:"name"`
+	Unit string `json:"unit,omitempty"`
+
+	// Stat is the aggregation this series was computed with. Per-series
+	// rather than per-request because the right statistic is a property
+	// of the metric: Sum for a counter, Average for a latency, Maximum
+	// for a concurrency ceiling. A chart that does not say which one it
+	// drew cannot be read.
+	Stat string `json:"stat,omitempty"`
+
+	// Label is the display name, including which target this series
+	// belongs to when a handle resolved to several.
+	Label string `json:"label,omitempty"`
+
 	Dims   map[string]string `json:"dims,omitempty"`
 	Points []Point           `json:"points"`
 

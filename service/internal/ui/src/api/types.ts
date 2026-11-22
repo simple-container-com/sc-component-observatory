@@ -222,6 +222,104 @@ export interface LogsResponse {
   filter?: string;
 }
 
+/** One bucket of one series. */
+export interface MetricPoint {
+  at: string;
+  value: number;
+}
+
+/**
+ * One metric series.
+ *
+ * `absent` is the reason `ListMetrics` is called at all: a metric that
+ * was never published and a metric that published nothing in the window
+ * are different answers, and both would otherwise render as the same
+ * flat line at zero. An absent series arrives WITH the response (not
+ * omitted from it) carrying `reason`, so the panel can say which.
+ *
+ * `stat` is per-series, not per-request: the right statistic belongs to
+ * the metric (Sum for a counter, Average for a latency, Maximum for a
+ * concurrency ceiling), and a chart that does not say which one it drew
+ * cannot be read. `unit` likewise comes from the provider — the SPA
+ * formats whatever it is handed and hard-codes no metric names, so a new
+ * cloud is a table on the Go side and no change here.
+ */
+export interface MetricSeries {
+  name: string;
+  unit?: string;
+  stat?: string;
+  /** Display name, including the target when a handle resolved to several. */
+  label?: string;
+  dims?: Record<string, string>;
+  /** Always an array, never null. Sparse: a bucket with no data is omitted. */
+  points: MetricPoint[];
+  absent?: boolean;
+  reason?: string;
+}
+
+/**
+ * A metric read, plus everything needed to say honestly what was drawn.
+ *
+ * Load-bearing fields, same discipline as `LogsResponse`:
+ *
+ * - `unavailable` — there was nothing to query, or nothing could be
+ *   queried. NOT "the workload was idle". When set, `series` is empty by
+ *   construction.
+ * - `period_seconds` + `adjusted` + `adjust_reason` — the bucket that
+ *   ACTUALLY ran. CloudWatch stops keeping fine resolution as data ages
+ *   and answers a too-fine query with an empty result rather than an
+ *   error, so the provider raises the period and says so. Labelling the
+ *   chart with the requested period would be a lie.
+ * - `capped` + `cap_reason` — the fan-out budget stopped short, so some
+ *   series were not read at all.
+ * - `warnings` — per-handle failures that did not sink the query.
+ * - `inferred` — the handles were guessed from naming conventions, so a
+ *   resolution that matched nothing may be a wrong guess rather than an
+ *   idle service.
+ *
+ * `series`, `queried` and `warnings` are always arrays — the Go side
+ * guarantees it, including `points` within each series.
+ */
+export interface MetricsResponse {
+  stack: string;
+  provider?: string;
+  /** The window ACTUALLY queried. Echoed so the axis labels the truth. */
+  window_start: string;
+  window_end: string;
+  period_seconds: number;
+  stat?: string;
+  adjusted: boolean;
+  adjust_reason?: string;
+  series: MetricSeries[];
+  capped: boolean;
+  cap_reason?: string;
+  calls: number;
+  /** The concrete targets charted — the first question when a chart is empty. */
+  queried: string[];
+  warnings: string[];
+  unavailable?: string;
+  inferred: boolean;
+}
+
+/**
+ * Metric query parameters.
+ *
+ * `period` is deliberately optional and normally omitted: the provider
+ * knows its cloud's retention ladder and a client-chosen period is
+ * exactly how a chart ends up empty. Same for `names` — empty means the
+ * provider's catalogue for the service's namespace, not "no metrics".
+ */
+export interface MetricsQuery {
+  minutes?: number;
+  start?: string;
+  end?: string;
+  /** Seconds. */
+  period?: number;
+  stat?: string;
+  /** Comma-joined on the wire. */
+  names?: string[];
+}
+
 /**
  * Log query parameters.
  *
