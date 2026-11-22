@@ -151,10 +151,24 @@ const (
 	// 48-hour window at 60s would otherwise get 2880 points per series.
 	maxPoints = 720
 
-	// listMetricsPages bounds discovery. 500 metrics per page, so two
-	// pages cover a namespace with a thousand entries; a prefix matching
-	// more than that is too broad to chart.
-	listMetricsPages = 2
+	// listMetricsPages bounds discovery. 500 metrics per page.
+	//
+	// It was 2, on the reasoning that a thousand entries covers any
+	// namespace worth charting. That is wrong for `AWS/Lambda` in this
+	// account: a prefix handle lists the WHOLE namespace (ListMetrics has
+	// no prefix operator), every function publishes its metrics under
+	// three dimension-set shapes, and every isolated stack ever deployed
+	// leaves its functions behind — so the fleet's own tenants sit well
+	// past entry 1000 and were being told metrics they emit every minute
+	// had "never been emitted" (live-caught 2026-11-22, see
+	// metricTarget.partial). Ten pages reaches them; `partial` keeps the
+	// answer honest if some other account ever runs past even that.
+	//
+	// The cost is paid once per cache miss per namespace, serially:
+	// ~10 ListMetrics calls, each a fraction of a second, behind a
+	// 2-minute cache. An exact-valued handle — every ECS one — still
+	// returns on page one.
+	listMetricsPages = 10
 
 	// getMetricDataCalls bounds pagination of the read itself.
 	getMetricDataCalls = 4
@@ -314,6 +328,28 @@ type metricTarget struct {
 	// does not exist for this workload and a metric that exists and
 	// reported nothing both come back as an empty array.
 	have map[string]bool
+
+	// partial says `have` is INCOMPLETE — discovery ran out of its page
+	// budget before CloudWatch ran out of metrics, so a name missing
+	// from it may simply be on a page that was never read.
+	//
+	// It exists because the absence message is an assertion of fact
+	// ("this workload has never emitted it"), and a truncated listing
+	// cannot support one. Live-caught 2026-11-22: five of the fleet's
+	// six Lambda tenants were each told a DIFFERENT arbitrary subset of
+	// Invocations/Errors/Throttles/Duration/ConcurrentExecutions had
+	// never been emitted — forge-sessions was missing three — while
+	// forge-conductor, listed earlier in the same namespace, had all
+	// five. Varying by position in the listing is the signature of
+	// truncation, not of workloads with different behaviour.
+	//
+	// A prefix handle is what makes it reachable: ListMetrics has no
+	// prefix operator, so resolving one lists the whole `AWS/Lambda`
+	// namespace (every function in the account, including every
+	// isolated stack's, each with a fresh Pulumi suffix) and filters
+	// client-side. An exact-valued handle — every ECS one — narrows at
+	// the API and lists a handful of entries, so it is never partial.
+	partial bool
 }
 
 // slot is one series being assembled: the result so far, the target it
@@ -400,7 +436,14 @@ func (p *Provider) Metrics(ctx context.Context, q telemetry.MetricQuery) (teleme
 				if len(targets) > 1 {
 					s.Label = def.Name + " · " + t.label
 				}
-				if !t.have[def.Name] {
+				// `partial` suspends this shortcut rather than softening
+				// its wording: with an incomplete listing the honest
+				// answer is not a hedged absence but no claim at all, so
+				// the metric is READ and whatever CloudWatch returns —
+				// points, or an empty window — is what the page shows.
+				// Costs one series in the batch; buys never telling an
+				// operator a metric does not exist when it does.
+				if !t.partial && !t.have[def.Name] {
 					s.Absent = true
 					s.Reason = fmt.Sprintf(
 						"CloudWatch lists no %s metric for %s — this workload has never emitted it, so there is no data to be missing",
@@ -649,11 +692,20 @@ func (p *Provider) resolveMetricTargets(ctx context.Context, sources []registry.
 			continue
 		}
 
-		found, n, err := p.listMetrics(ctx, region, s.Ref, filters)
+		found, truncated, n, err := p.listMetrics(ctx, region, s.Ref, filters)
 		calls += n
 		if err != nil {
 			warns = append(warns, fmt.Sprintf("listing metrics in %s: %s", s.Ref, errText(err)))
 			continue
+		}
+		if truncated {
+			// Say it, because the page the charts are about to render
+			// looks no different: the series are read either way, and
+			// only the "never emitted" shortcut is suspended.
+			warns = append(warns, fmt.Sprintf(
+				"metric discovery in %s (%s) hit its %d-page limit while CloudWatch had more to list, so which metrics exist for %s is only partly known — every metric in the catalogue is being read rather than reported absent",
+				s.Ref, region, listMetricsPages, describeFilters(filters, prefixes),
+			))
 		}
 
 		matched := 0
@@ -674,6 +726,7 @@ func (p *Provider) resolveMetricTargets(ctx context.Context, sources []registry.
 				label:     labelOf(e.dims),
 				from:      s.Ref,
 				have:      e.names,
+				partial:   truncated,
 			})
 		}
 		if matched == 0 {
@@ -779,18 +832,22 @@ type listedTarget struct {
 // `{FunctionName, Resource}` and `{FunctionName, ExecutedVersion}`, and
 // accepting all three would chart one function three times with three
 // different totals.
-func (p *Provider) listMetrics(ctx context.Context, region, namespace string, filters []cwmtypes.DimensionFilter) ([]listedTarget, int, error) {
+// The second return value reports that discovery was TRUNCATED: the
+// page budget ran out while CloudWatch still had pages. The names
+// gathered are then a prefix of the truth, and the caller must not read
+// absence from them — see metricTarget.partial.
+func (p *Provider) listMetrics(ctx context.Context, region, namespace string, filters []cwmtypes.DimensionFilter) ([]listedTarget, bool, int, error) {
 	cacheKey := region + "|" + namespace + "|" + describeFilters(filters, nil)
 	p.mu.Lock()
 	if e, ok := p.metrics[cacheKey]; ok && p.now().Sub(e.at) < metricCacheTTL {
 		p.mu.Unlock()
-		return e.targets, 0, nil
+		return e.targets, e.truncated, 0, nil
 	}
 	p.mu.Unlock()
 
 	cl, err := p.metricClient(ctx, region)
 	if err != nil {
-		return nil, 0, err
+		return nil, false, 0, err
 	}
 
 	want := make(map[string]bool, len(filters))
@@ -799,9 +856,10 @@ func (p *Provider) listMetrics(ctx context.Context, region, namespace string, fi
 	}
 
 	var (
-		calls int
-		token *string
-		byKey = map[string]*listedTarget{}
+		calls     int
+		token     *string
+		truncated bool
+		byKey     = map[string]*listedTarget{}
 	)
 	for i := 0; i < listMetricsPages; i++ {
 		out, err := cl.ListMetrics(ctx, &cloudwatch.ListMetricsInput{
@@ -811,7 +869,7 @@ func (p *Provider) listMetrics(ctx context.Context, region, namespace string, fi
 		})
 		calls++
 		if err != nil {
-			return nil, calls, err
+			return nil, false, calls, err
 		}
 		for _, m := range out.Metrics {
 			dims := map[string]string{}
@@ -839,6 +897,11 @@ func (p *Provider) listMetrics(ctx context.Context, region, namespace string, fi
 			break
 		}
 		token = out.NextToken
+		// Still a page to go on the LAST permitted iteration: the budget
+		// is what stopped us, not CloudWatch.
+		if i == listMetricsPages-1 {
+			truncated = true
+		}
 	}
 
 	keys := make([]string, 0, len(byKey))
@@ -852,9 +915,9 @@ func (p *Provider) listMetrics(ctx context.Context, region, namespace string, fi
 	}
 
 	p.mu.Lock()
-	p.metrics[cacheKey] = metricCacheEntry{targets: out, at: p.now()}
+	p.metrics[cacheKey] = metricCacheEntry{targets: out, truncated: truncated, at: p.now()}
 	p.mu.Unlock()
-	return out, calls, nil
+	return out, truncated, calls, nil
 }
 
 func (p *Provider) metricClient(ctx context.Context, region string) (cwmAPI, error) {

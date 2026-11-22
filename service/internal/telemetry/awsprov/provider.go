@@ -113,7 +113,10 @@ type groupCacheEntry struct {
 
 type metricCacheEntry struct {
 	targets []listedTarget
-	at      time.Time
+	// truncated is cached with the targets so a cache HIT cannot quietly
+	// present a partial listing as a complete one.
+	truncated bool
+	at        time.Time
 }
 
 // Defaults chosen to make capping rare rather than to make it
