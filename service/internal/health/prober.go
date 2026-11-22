@@ -96,7 +96,19 @@ func NewHTTPProber(timeout time.Duration) *HTTPProber {
 // default rather than a declaration. A 500 means the right endpoint is
 // unhealthy, and retrying a different path would convert a real outage
 // into a green tick.
-var FallbackPaths = []string{"/health"}
+// `/api/status` is the third spelling, and it arrived with the first
+// non-Lambda tenants: forge-baas and baas-meeting serve it. They are
+// `cloud-compose` stacks, and a compose stack DOES record its probe
+// path — as the `simple-container.com/healthcheck/path` label inside
+// the docker-compose file, which SC's ECS template reads for the target
+// group. That file is not part of the client descriptor this component
+// receives (the descriptor carries only `dockerComposeFile`, the path
+// to it), so the value is unreachable from here and the spelling has to
+// be tried rather than read. Reading the label properly means the
+// plugin opening the compose file at deploy time and publishing the
+// path with the registration — worth doing, not worth blocking the ECS
+// wiring on.
+var FallbackPaths = []string{"/health", "/api/status"}
 
 func (p *HTTPProber) Probe(ctx context.Context, url string) registry.HealthResult {
 	res := p.probeOnce(ctx, url)

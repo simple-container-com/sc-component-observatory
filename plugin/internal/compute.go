@@ -177,7 +177,7 @@ func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInp
 // services opt into passing it as a build arg), so it is best-effort
 // and the service falls back to the short SHA inside the CalVer string.
 func (p *Processor) buildRecord(stackName string, input api.ResourceInput, collector pApi.ComputeContextCollector, clientCfg map[string]any, fpKey []byte) ServiceRecord {
-	template := p.deriveTemplate(input)
+	template := p.deriveTemplate(clientCfg)
 	region := p.deriveRegion(input)
 
 	rec := ServiceRecord{
@@ -312,12 +312,36 @@ func (p *Processor) deriveCommit(collector pApi.ComputeContextCollector) string 
 	return envFromCollector(collector, "GITHUB_SHA", "COMMIT", "REVISION")
 }
 
-func (p *Processor) deriveTemplate(input api.ResourceInput) string {
-	raw := configRaw(input)
-	if t, ok := raw["deployTo"].(string); ok && t != "" {
-		return t
-	}
-	return ""
+// deriveTemplate names the template the CONSUMER deploys with.
+//
+// The consumer's, NOT this component's — and that distinction is the
+// bug this function used to be. It read `deployTo` out of
+// `configRaw(input)`, which is `my-observatory`'s OWN opaque config:
+// `deployTo: lambda` says where the OBSERVATORY's Lambda runs and says
+// nothing whatsoever about the service being registered. So every
+// tenant registered as `template: lambda`.
+//
+// That was invisible for as long as every tenant happened to be a
+// Lambda — all six were — and it became wrong the moment an
+// `ecs-fargate` stack was wired in: the record claims `lambda`, the
+// read-time derivation (registry.WithDerivedSources) therefore hands it
+// `<stack>-access-logs` and `AWS/Lambda`, and both panels resolve to
+// nothing. The failure mode is the component's own worst case — a
+// confident answer about the wrong resource.
+//
+// The consumer's template rides the client descriptor (api#639),
+// searched the nested way for the same reason the endpoint URL is: the
+// descriptor is wrapped, `template` sits at its top level today, and
+// hard-coding the path breaks in silence if api adds a level.
+//
+// Returns "" when there is no descriptor (an SC core older than #639).
+// There is deliberately NO fallback to the component's own `deployTo`:
+// guessing the consumer's template from a different stack's config is
+// what produced the bug, and "" degrades honestly — CloudForTemplate
+// declines, no handles are inferred, and the dashboard says it has no
+// telemetry wired for the service rather than charting someone else's.
+func (p *Processor) deriveTemplate(clientCfg map[string]any) string {
+	return findStringDeep(clientCfg, "template")
 }
 
 func (p *Processor) deriveRegion(input api.ResourceInput) string {

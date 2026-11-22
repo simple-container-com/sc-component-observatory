@@ -108,19 +108,7 @@ func InferSources(stack, template, region string) []TelemetrySource {
 	case CloudAWS:
 		switch strings.ToLower(template) {
 		case "ecs-fargate":
-			// ECS task definitions created by sc-plugin-aws log to
-			// `/ecs/<family>`; the family is the stack name.
-			return []TelemetrySource{{
-				Kind:   KindCloudWatchLogs,
-				Ref:    "/ecs/" + stack,
-				Region: region,
-				Dims:   map[string]string{"ClusterName": stack, "match": "prefix"},
-			}, {
-				Kind:   KindCloudWatchMetrics,
-				Ref:    "AWS/ECS",
-				Region: region,
-				Dims:   map[string]string{"ClusterName": stack},
-			}}
+			return ecsSources(stack, region)
 		default:
 			return []TelemetrySource{{
 				Kind:   KindCloudWatchLogs,
@@ -150,4 +138,52 @@ func InferSources(stack, template, region string) []TelemetrySource {
 		return nil
 	}
 	return nil
+}
+
+// ecsSources derives what sc-plugin-aws's `ecs-fargate` template
+// creates. Mirror of the service's registry.ecsSources — the service
+// copy is the one that DECIDES (it re-derives at read time), and the
+// rationale for every name, with the live evidence, is written there.
+//
+// The short version: `stack` already ends in `--<env>`, the template
+// appends the environment a SECOND time to build its "simple" cluster
+// name, the log group keeps the `--` while the cluster and service
+// names collapse it to `_`, and AWS/ECS metrics need ClusterName AND
+// ServiceName. Live, for `forge-baas--staging`:
+// `/ecs/forge-baas--staging-staging`,
+// `forge-baas_staging-staging-cluster`,
+// `forge-baas_staging-staging-svc`.
+func ecsSources(stack, region string) []TelemetrySource {
+	env := envOfStack(stack)
+	if env == "" {
+		return nil
+	}
+	simple := stack + "-" + env
+	return []TelemetrySource{{
+		Kind:   KindCloudWatchLogs,
+		Ref:    "/ecs/" + simple,
+		Region: region,
+	}, {
+		Kind:   KindCloudWatchMetrics,
+		Ref:    "AWS/ECS",
+		Region: region,
+		Dims: map[string]string{
+			"ClusterName": awsResName(simple, "cluster"),
+			"ServiceName": awsResName(simple, "svc"),
+		},
+	}}
+}
+
+// envOfStack recovers the environment from an SC `<stack>--<env>` name.
+func envOfStack(stack string) string {
+	if i := strings.LastIndex(stack, "--"); i >= 0 && i+2 < len(stack) {
+		return stack[i+2:]
+	}
+	return ""
+}
+
+// awsResName mirrors sc-plugin-aws's helper of the same name
+// (plugin/internal/ecs_fargate.go:1287).
+func awsResName(name, suffix string) string {
+	return strings.ReplaceAll(name+"-"+suffix, "--", "_")
 }
