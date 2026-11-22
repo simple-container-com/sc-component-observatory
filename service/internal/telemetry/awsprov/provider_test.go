@@ -39,6 +39,12 @@ type fakeCW struct {
 	describeCalls int
 	describeErr   error
 	lastFilter    cloudwatchlogs.FilterLogEventsInput
+
+	// filters records EVERY FilterLogEvents input, because the scan
+	// reads a window as several sub-windows now — asserting on the last
+	// one alone would have said nothing about the newest, which is the
+	// one a tail depends on.
+	filters []cloudwatchlogs.FilterLogEventsInput
 }
 
 func (f *fakeCW) DescribeLogGroups(_ context.Context, in *cloudwatchlogs.DescribeLogGroupsInput, _ ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.DescribeLogGroupsOutput, error) {
@@ -59,6 +65,7 @@ func (f *fakeCW) DescribeLogGroups(_ context.Context, in *cloudwatchlogs.Describ
 func (f *fakeCW) FilterLogEvents(_ context.Context, in *cloudwatchlogs.FilterLogEventsInput, _ ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.FilterLogEventsOutput, error) {
 	f.filterCalls++
 	f.lastFilter = *in
+	f.filters = append(f.filters, *in)
 	group := aws.ToString(in.LogGroupName)
 	if err, ok := f.failGroup[group]; ok {
 		return nil, err
@@ -128,6 +135,120 @@ func exactSource(ref string) registry.TelemetrySource {
 func window(q *telemetry.LogQuery) {
 	q.Start = base.Add(-time.Hour)
 	q.End = base.Add(time.Hour)
+}
+
+// TestLogs_BusyWindowTailIsTheTrueNewest is the regression test for the
+// 2026-11-22 live finding, and the reason the scan reads the window
+// backwards in chunks.
+//
+// A loud log group with a modest budget is the case that was wrong: a
+// forward walk spent its whole allowance on the window's oldest minutes
+// and returned those events as "the latest logs", under a header saying
+// the window ended now. On staging that meant an hour-stale tail for
+// every unfiltered query against forge-conductor.
+//
+// The budget here is deliberately far too small to read the window:
+// 1000 events at a page size of 100 would need ten calls and four are
+// allowed. Reading from the newest end makes that irrelevant — and the
+// page must come back NOT capped, because nothing was missed that could
+// have belonged on it.
+func TestLogs_BusyWindowTailIsTheTrueNewest(t *testing.T) {
+	var evs []cwtypes.FilteredLogEvent
+	for i := 0; i < 1000; i++ {
+		// 3.6s apart, filling the hour before `base`.
+		evs = append(evs, ev(fmt.Sprintf("e%d", i), -time.Duration(1000-i)*3600*time.Millisecond, fmt.Sprintf("line-%d", i)))
+	}
+	f := &fakeCW{
+		groups:   []string{"/aws/lambda/svc"},
+		events:   map[string][]cwtypes.FilteredLogEvent{"/aws/lambda/svc": evs},
+		pageSize: 100,
+	}
+	p := newProvider(t, f)
+	page, err := p.Logs(context.Background(), telemetry.LogQuery{
+		Sources: []registry.TelemetrySource{exactSource("/aws/lambda/svc")},
+		Limit:   5,
+		Start:   base.Add(-time.Hour),
+		End:     base,
+		Budget:  telemetry.Budget{MaxCalls: 4},
+	})
+	if err != nil {
+		t.Fatalf("Logs: %v", err)
+	}
+	if len(page.Events) != 5 {
+		t.Fatalf("want a full page of 5, got %d", len(page.Events))
+	}
+	// e999 is the newest event in the window. Before the fix this was
+	// e0..e4 — the oldest.
+	if page.Events[0].Message != "line-999" {
+		t.Errorf("newest event = %q, want line-999: the tail is showing the wrong end of the window",
+			page.Events[0].Message)
+	}
+	if page.Events[4].Message != "line-995" {
+		t.Errorf("oldest event on the page = %q, want line-995", page.Events[4].Message)
+	}
+	if page.Capped {
+		t.Errorf("page reports capped=%v (%q), but it holds the window's true newest events — a cap here would send the reader looking for data that is already on screen",
+			page.Capped, page.CapReason)
+	}
+	// It must also be CHEAP: finding the newest five events should not
+	// read the hour. One 30-second chunk holds more than five.
+	if page.Scanned > 50 {
+		t.Errorf("scanned %d events to return 5 — the backward walk is not stopping early", page.Scanned)
+	}
+	if page.Calls > 2 {
+		t.Errorf("spent %d calls on a tail, want 1-2", page.Calls)
+	}
+	if page.NextCursor == "" {
+		t.Error("a full page must carry a cursor; there is an hour of older events behind it")
+	}
+}
+
+// TestLogs_ResponseByteCapTrimsThePageNotTheScan. MaxBytes exists for
+// the Function URL's hard response limit, so it must bound what is
+// RETURNED. Counting it against the scan instead is what stopped the
+// walk five minutes into a sixty-minute window — and it did that while
+// returning a three-event page of a few KiB, nowhere near the cap it
+// claimed to have hit.
+func TestLogs_ResponseByteCapTrimsThePageNotTheScan(t *testing.T) {
+	big := strings.Repeat("x", 1000)
+	var evs []cwtypes.FilteredLogEvent
+	for i := 0; i < 5; i++ {
+		evs = append(evs, ev(fmt.Sprintf("e%d", i), time.Duration(i)*time.Second, fmt.Sprintf("%d-%s", i, big)))
+	}
+	f := &fakeCW{
+		groups: []string{"/aws/lambda/svc"},
+		events: map[string][]cwtypes.FilteredLogEvent{"/aws/lambda/svc": evs},
+	}
+	p := newProvider(t, f)
+	q := telemetry.LogQuery{
+		Sources: []registry.TelemetrySource{exactSource("/aws/lambda/svc")},
+		Limit:   10,
+		Budget:  telemetry.Budget{MaxBytes: 2500},
+	}
+	window(&q)
+	page, err := p.Logs(context.Background(), q)
+	if err != nil {
+		t.Fatalf("Logs: %v", err)
+	}
+	if len(page.Events) != 2 {
+		t.Fatalf("want the newest 2 events to fit 2500 bytes, got %d", len(page.Events))
+	}
+	// Newest kept, oldest dropped — the same direction "load older" goes.
+	if !strings.HasPrefix(page.Events[0].Message, "4-") {
+		t.Errorf("newest returned event = %.10q, want event 4: the trim took the wrong end", page.Events[0].Message)
+	}
+	if !page.Capped || !strings.Contains(page.CapReason, "response-size cap") {
+		t.Errorf("a trimmed page must say so: capped=%v reason=%q", page.Capped, page.CapReason)
+	}
+	// Short page, but there IS more — so the cursor has to be there or
+	// the dropped events are unreachable.
+	if page.NextCursor == "" {
+		t.Error("no cursor on a byte-trimmed page: the events it dropped would be unreachable")
+	}
+	// And the scan itself must not have been cut short by the byte cap.
+	if page.Scanned != 5 {
+		t.Errorf("scanned = %d, want all 5: MaxBytes must not bound the scan", page.Scanned)
+	}
 }
 
 // TestLogs_ReturnsNewestFirstAndTails is the core promise: the page is
@@ -297,9 +418,19 @@ func TestLogs_ScanCapIsReportedNotHidden(t *testing.T) {
 		t.Fatal("Capped with no reason is unactionable")
 	}
 	// The reason must warn that this is NOT the newest of the window —
-	// the whole point of surfacing it.
-	if !strings.Contains(page.CapReason, "not of the whole window") {
+	// the whole point of surfacing it — and name the limit that bound,
+	// because "ran out" alone does not tell a reader which knob moved.
+	if !strings.Contains(page.CapReason, "NOT of the whole window") {
 		t.Errorf("cap reason does not say the result is a partial scan: %q", page.CapReason)
+	}
+	if !strings.Contains(page.CapReason, "call cap") {
+		t.Errorf("cap reason does not name the CALL cap as what stopped it: %q", page.CapReason)
+	}
+	// Since the scan reads newest-chunk-first, a capped page must also
+	// say which interval it read — the timestamps alone cannot tell a
+	// reader that the rest of the window was never looked at.
+	if !strings.Contains(page.CapReason, "OLDEST events of that interval") {
+		t.Errorf("cap reason does not say which end of which interval this is: %q", page.CapReason)
 	}
 	if page.Calls != 2 {
 		t.Errorf("calls = %d, want exactly the budget (2)", page.Calls)
@@ -329,7 +460,7 @@ func TestLogs_EventScanCap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Logs: %v", err)
 	}
-	if !page.Capped || !strings.Contains(page.CapReason, "scan cap") {
+	if !page.Capped || !strings.Contains(page.CapReason, "the scan cap stopped") {
 		t.Fatalf("want a scan-cap stop, got capped=%v reason=%q", page.Capped, page.CapReason)
 	}
 	if page.Scanned > 20 {
@@ -539,10 +670,14 @@ func TestLogs_LongMessageTruncatedAndFlagged(t *testing.T) {
 	}
 }
 
-// TestLogs_WindowIsPassedThroughVerbatim — the provider must query the
-// window it was given. An invented window returns results from a period
-// the UI is not displaying.
-func TestLogs_WindowIsPassedThroughVerbatim(t *testing.T) {
+// TestLogs_SubWindowsTileTheWindowExactly — the provider must read the
+// window it was given, no more and no less. It no longer reads it in
+// one call, so "verbatim" now means the sub-windows TILE it: the first
+// one ends where the window ends (or a tail is stale), the last begins
+// where it begins (or the oldest events are unreachable), and none of
+// them reaches outside (or the page shows a period the UI is not
+// displaying).
+func TestLogs_SubWindowsTileTheWindowExactly(t *testing.T) {
 	f := &fakeCW{
 		groups: []string{"/aws/lambda/svc"},
 		events: map[string][]cwtypes.FilteredLogEvent{"/aws/lambda/svc": {ev("1", 0, "x")}},
@@ -556,14 +691,40 @@ func TestLogs_WindowIsPassedThroughVerbatim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Logs: %v", err)
 	}
-	if got := aws.ToInt64(f.lastFilter.StartTime); got != start.UnixMilli() {
-		t.Errorf("StartTime = %d, want %d", got, start.UnixMilli())
+	if len(f.filters) == 0 {
+		t.Fatal("no FilterLogEvents call was made")
 	}
-	if got := aws.ToInt64(f.lastFilter.EndTime); got != end.UnixMilli() {
-		t.Errorf("EndTime = %d, want %d", got, end.UnixMilli())
+	if got := aws.ToInt64(f.filters[0].EndTime); got != end.UnixMilli() {
+		t.Errorf("first sub-window ends at %d, want the window end %d — a tail that starts earlier is already stale",
+			got, end.UnixMilli())
 	}
-	if got := aws.ToString(f.lastFilter.FilterPattern); got != "ERROR" {
-		t.Errorf("FilterPattern = %q, want it passed through verbatim", got)
+	oldest := aws.ToInt64(f.filters[len(f.filters)-1].StartTime)
+	if oldest != start.UnixMilli() {
+		t.Errorf("last sub-window starts at %d, want the window start %d — the rest of the window is unreachable",
+			oldest, start.UnixMilli())
+	}
+	// Deduplicated: paginating one sub-window repeats its bounds with a
+	// new token, which is not a second sub-window.
+	var bounds [][2]int64
+	for i, in := range f.filters {
+		s, e := aws.ToInt64(in.StartTime), aws.ToInt64(in.EndTime)
+		if s < start.UnixMilli() || e > end.UnixMilli() {
+			t.Errorf("sub-window %d (%d–%d) reaches outside the requested window", i, s, e)
+		}
+		if got := aws.ToString(in.FilterPattern); got != "ERROR" {
+			t.Errorf("sub-window %d FilterPattern = %q, want it passed through verbatim", i, got)
+		}
+		if n := len(bounds); n == 0 || bounds[n-1] != [2]int64{s, e} {
+			bounds = append(bounds, [2]int64{s, e})
+		}
+	}
+	// Contiguous and strictly older, so nothing between two chunks is
+	// skipped and nothing is read twice.
+	for i := 1; i < len(bounds); i++ {
+		if bounds[i][1] != bounds[i-1][0] {
+			t.Errorf("sub-window %d ends at %d but the previous began at %d — a gap or an overlap",
+				i, bounds[i][1], bounds[i-1][0])
+		}
 	}
 }
 

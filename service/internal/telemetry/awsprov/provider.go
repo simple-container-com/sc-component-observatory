@@ -113,8 +113,15 @@ const (
 	// defaultMaxEventsScanned bounds the CloudWatch bill.
 	defaultMaxEventsScanned = 20000
 
-	// defaultMaxBytes bounds the response. A Function URL caps its
+	// defaultMaxBytes bounds the RESPONSE — the bytes actually handed
+	// back, not the bytes scanned to find them. A Function URL caps its
 	// response hard, and exceeding it fails the whole request.
+	//
+	// The distinction is not pedantry: counting it against the scan is
+	// what made an unfiltered tail stop five minutes into a sixty-minute
+	// window and return the wrong end of it (see scan). Scan volume is
+	// bounded by MaxEventsScanned and MaxCalls, which is where that
+	// belongs.
 	defaultMaxBytes = 2 << 20 // 2 MiB
 
 	// defaultMaxMessageBytes truncates one oversized line rather than
@@ -130,7 +137,20 @@ const (
 	// even when several share the budget. A group silently skipped
 	// because an earlier one exhausted the allowance is indistinguishable
 	// from a group with no matching lines.
-	minCallsPerTarget = 2
+	//
+	// Four, not two: the backward chunk walk spends a call per chunk, so
+	// a two-call allowance would cover only the newest ~2.5 minutes of a
+	// quiet group's window and report a cap for the rest.
+	minCallsPerTarget = 4
+
+	// The backward scan's chunk sizes, anchored at the window's end and
+	// growing as the walk moves older. Small first chunk so a busy group
+	// answers a tail in one call; ×8 growth so a quiet group still
+	// reaches 48h in ~6 chunks instead of spending the call budget on
+	// empty intervals.
+	firstChunk  = 30 * time.Second
+	chunkGrowth = 8
+	maxChunk    = 12 * time.Hour
 )
 
 // New builds the provider. It does NOT verify the credential — that is
@@ -211,13 +231,13 @@ type target struct {
 //
 // The page is the NEWEST `Limit` events in the window, which needs a
 // word of explanation: CloudWatch's FilterLogEvents only walks a window
-// forward, so there is no "last N" call to make. The scan therefore
-// walks the window and keeps the newest Limit events in a ring buffer.
-// When the budget stops that walk early the result is the newest events
-// of the portion SCANNED — not of the window — and CapReason says
-// exactly that. Presenting the first page of a wide window as "the
-// latest logs" would be the dashboard lying about which end of the
-// window it is showing.
+// forward, so there is no "last N" call to make. scan() therefore reads
+// the window newest-sub-window-first and stops as soon as it holds a
+// full page — see its comment for why the straightforward forward walk
+// returned the wrong end of a busy window. When the budget stops even
+// that early, CapReason names the interval that was read and which end
+// of it the events come from: presenting the oldest part of a window as
+// "the latest logs" would be the dashboard lying about its own axis.
 func (p *Provider) Logs(ctx context.Context, q telemetry.LogQuery) (telemetry.LogPage, error) {
 	page := telemetry.LogPage{
 		Events:   []telemetry.LogEvent{},
@@ -278,11 +298,14 @@ func (p *Provider) Logs(ctx context.Context, q telemetry.LogQuery) (telemetry.Lo
 	// Split the budget across targets rather than letting the first one
 	// consume it. A log group skipped for lack of allowance returns the
 	// same empty list as a log group with nothing in it.
+	//
+	// MaxBytes is deliberately NOT split: it bounds the one response
+	// these targets jointly produce, and is applied once to the merged
+	// page below.
 	perTarget := budget
 	if n := len(targets); n > 1 {
 		perTarget.MaxCalls = max(budget.MaxCalls/n, minCallsPerTarget)
 		perTarget.MaxEventsScanned = max(budget.MaxEventsScanned/n, 1)
-		perTarget.MaxBytes = max(budget.MaxBytes/n, 1)
 	}
 
 	var (
@@ -346,18 +369,54 @@ func (p *Provider) Logs(ctx context.Context, q telemetry.LogQuery) (telemetry.Lo
 		}
 		return merged[i].At.After(merged[j].At)
 	})
+	full := len(merged) >= limit
 	if len(merged) > limit {
 		merged = merged[:limit]
+	}
+
+	// The response-size budget, applied to what is RETURNED. merged is
+	// newest-first, so trimming the tail keeps the newest events and
+	// drops the oldest — the same direction "load older" continues in.
+	if trimmed, dropped := trimToBytes(merged, budget.MaxBytes); dropped > 0 {
+		merged = trimmed
+		full = true // there IS older data; the cursor below must say so
+		page.Capped = true
+		page.CapReason = fmt.Sprintf(
+			"the page was trimmed to its newest %d events (about %d KiB): %d older events that were read did not fit the response-size cap — page back with the cursor, or narrow the window",
+			len(merged), budget.MaxBytes/1024, dropped,
+		)
 	}
 	page.Events = merged
 
 	// A cursor only means something when the page filled: a short page
 	// means the window was exhausted, and handing back a cursor there
 	// would invite an endless "load more" that always returns nothing.
-	if len(merged) == limit {
+	// A byte-trimmed page counts as filled even when it is short — the
+	// events it dropped are exactly what the next page must serve.
+	if full && len(merged) > 0 {
 		page.NextCursor = telemetry.CursorFor(merged)
 	}
 	return page, nil
+}
+
+// trimToBytes drops events from the OLD end until the page fits the
+// response budget, returning the kept slice and how many went.
+//
+// At least one event always survives: a single line longer than the
+// whole budget is already truncated to MaxMessageBytes, and returning
+// an empty page for it would report "the window was quiet".
+func trimToBytes(events []telemetry.LogEvent, maxBytes int) ([]telemetry.LogEvent, int) {
+	if maxBytes <= 0 {
+		return events, 0
+	}
+	total := 0
+	for i := range events {
+		total += len(events[i].Message)
+		if total > maxBytes && i > 0 {
+			return events[:i], len(events) - i
+		}
+	}
+	return events, 0
 }
 
 type scanResult struct {
@@ -368,8 +427,45 @@ type scanResult struct {
 	capReason string
 }
 
-// scan walks one log group's window forward, keeping the newest `limit`
-// events.
+// stopReason names which of the two scan limits ran out. Neither is
+// something a reader can raise, but they lead to different reads of the
+// same page: the call cap means the group pages slowly, the scan cap
+// means it is loud, and "add a filter" helps the second much more than
+// the first.
+func (r *scanResult) stopReason(budget telemetry.Budget) string {
+	if r.scanned >= budget.MaxEventsScanned {
+		return fmt.Sprintf("the scan cap stopped this read after %d events", r.scanned)
+	}
+	return fmt.Sprintf("the per-request call cap stopped this read after %d CloudWatch calls", r.calls)
+}
+
+// scan reads the NEWEST `limit` events of one log group's window.
+//
+// # Why this walks the window in chunks instead of straight through
+//
+// FilterLogEvents has exactly one direction: forward from StartTime.
+// The first cut therefore walked the whole window forward and kept the
+// newest `limit` events in a ring — correct when the walk completes,
+// and wrong in a specific, bad way when the budget stops it early: the
+// events held are then the newest of the window's OLDEST part, while
+// the panel's header still says the window ends now.
+//
+// Live-caught 2026-11-22 on monitor.simple-forge.com: an unfiltered
+// 60-minute tail of forge-conductor--staging capped three calls in and
+// returned events from 12:16 under a window labelled `-> 13:12`. The
+// cap reason said so, so nothing was silently wrong — but "tail this
+// service" is the panel's main use and it showed an hour-stale page by
+// default. (With a filter it was always right: fewer matches meant the
+// walk reached the window's end.)
+//
+// So: cut the window into sub-windows and scan the NEWEST one first,
+// growing older chunks geometrically. Within a chunk the walk is still
+// forward — it just finishes. Once the ring holds `limit` events the
+// scan stops, because every event not yet read lies in an older chunk
+// and therefore cannot displace anything held. A busy service now
+// answers from the first 30-second chunk in one or two calls; a quiet
+// one pays ~6 calls to cover 48 hours, which is what the call budget is
+// for.
 func (p *Provider) scan(
 	ctx context.Context, t target, filter string,
 	start, end time.Time, limit int,
@@ -382,9 +478,62 @@ func (p *Provider) scan(
 	}
 
 	keep := newRing(limit)
-	var bytesSeen int
-	var token *string
+	chunk := firstChunk
+	cur := end
 
+	for cur.After(start) {
+		chunkStart := cur.Add(-chunk)
+		if chunkStart.Before(start) {
+			chunkStart = start
+		}
+		done, err := p.scanChunk(ctx, cl, t, filter, chunkStart, cur, keep, &res, budget, exclude)
+		if err != nil {
+			return res, err
+		}
+		if !done {
+			// The budget ran out INSIDE this chunk, so the ring holds the
+			// oldest events of it rather than the newest. Say which
+			// interval was read and which end of it this is — the reader
+			// cannot tell from the timestamps alone, and a filter is the
+			// fix rather than a wider window.
+			res.capped = true
+			res.capReason = fmt.Sprintf(
+				"%s inside %s–%s, which this log group fills faster than one request may read: these are the OLDEST events of that interval and NOT of the whole window — add a filter to narrow what is scanned",
+				res.stopReason(budget),
+				chunkStart.Format(time.RFC3339), cur.Format(time.RFC3339),
+			)
+			break
+		}
+		if keep.len() >= limit {
+			// Everything still unread is older than everything held, so
+			// the page is already the window's true newest. Not a cap.
+			break
+		}
+		cur = chunkStart
+		if chunk <= maxChunk/chunkGrowth {
+			chunk *= chunkGrowth
+		} else {
+			chunk = maxChunk
+		}
+	}
+
+	res.events = keep.items()
+	return res, nil
+}
+
+// scanChunk walks one sub-window forward to exhaustion, pushing what it
+// reads into keep. It reports whether the sub-window was FINISHED — a
+// false means the shared budget stopped it part-way, which the caller
+// has to describe differently from a completed chunk because the ring
+// then holds the wrong end of the interval.
+//
+// Budget counters live on res and are shared across chunks on purpose:
+// the cap bounds one HTTP request's cost, not one chunk's.
+func (p *Provider) scanChunk(
+	ctx context.Context, cl cwAPI, t target, filter string,
+	start, end time.Time, keep *ring, res *scanResult,
+	budget telemetry.Budget, exclude map[string]bool,
+) (bool, error) {
 	in := &cloudwatchlogs.FilterLogEventsInput{
 		LogGroupName: aws.String(t.group),
 		StartTime:    aws.Int64(start.UnixMilli()),
@@ -395,20 +544,16 @@ func (p *Provider) scan(
 		in.FilterPattern = aws.String(filter)
 	}
 
+	var token *string
 	for {
-		if res.calls >= budget.MaxCalls {
-			res.capped = true
-			res.capReason = fmt.Sprintf(
-				"stopped after %d CloudWatch calls (the per-request cap): these are the newest events of the part of the window that was scanned, not of the whole window — narrow the window or add a filter",
-				res.calls,
-			)
-			break
+		if res.calls >= budget.MaxCalls || res.scanned >= budget.MaxEventsScanned {
+			return false, nil
 		}
 		in.NextToken = token
 		out, err := cl.FilterLogEvents(ctx, in)
 		res.calls++
 		if err != nil {
-			return res, err
+			return false, err
 		}
 		for i := range out.Events {
 			ev := toEvent(out.Events[i], t.from, budget.MaxMessageBytes)
@@ -416,33 +561,13 @@ func (p *Provider) scan(
 			if ev.ID != "" && exclude[ev.ID] {
 				continue
 			}
-			bytesSeen += len(ev.Message)
 			keep.push(ev)
 		}
-		if bytesSeen >= budget.MaxBytes {
-			res.capped = true
-			res.capReason = fmt.Sprintf(
-				"stopped after about %d KiB of log text (the response-size cap): these are the newest events of the part of the window that was scanned — narrow the window or add a filter",
-				bytesSeen/1024,
-			)
-			break
-		}
-		if res.scanned >= budget.MaxEventsScanned {
-			res.capped = true
-			res.capReason = fmt.Sprintf(
-				"stopped after scanning %d events (the scan cap): these are the newest events of the part of the window that was scanned, not of the whole window — narrow the window or add a filter",
-				res.scanned,
-			)
-			break
-		}
 		if out.NextToken == nil || *out.NextToken == "" {
-			break
+			return true, nil
 		}
 		token = out.NextToken
 	}
-
-	res.events = keep.items()
-	return res, nil
 }
 
 // resolveTargets turns handles into concrete log groups, expanding the
@@ -674,6 +799,10 @@ func (r *ring) push(e telemetry.LogEvent) {
 	r.buf[r.start] = e
 	r.start = (r.start + 1) % len(r.buf)
 }
+
+// len is how many events are held, which is what tells the backward
+// scan it may stop: a full ring cannot be displaced by anything older.
+func (r *ring) len() int { return r.count }
 
 func (r *ring) items() []telemetry.LogEvent {
 	out := make([]telemetry.LogEvent, 0, r.count)
