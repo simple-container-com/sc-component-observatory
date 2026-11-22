@@ -53,16 +53,25 @@ export const api = {
   service: (stack: string) =>
     request<ServiceDetail>("GET", `/api/v1/services/${encodeURIComponent(stack)}`),
   /**
-   * The deploy timeline WITH a per-deploy config diff. Separate from
-   * `service()` because each row costs the backend a snapshot read, so
-   * the detail payload carries the timeline without diffs and this is
-   * fetched alongside it.
+   * One page of the deploy timeline, newest-first, WITH a per-deploy
+   * config diff. Separate from `service()` because each row costs the
+   * backend a snapshot read, so the detail payload carries the timeline
+   * without diffs and this is fetched alongside it.
+   *
+   * `cursor` comes from the previous page's `next_cursor` — never
+   * constructed here. It is an opaque token by design (see
+   * telemetry/cursor.go), so the SPA's job is to hand it back unread.
    */
-  deploys: (stack: string, limit?: number) =>
-    request<DeploysResponse>(
+  deploys: (stack: string, query: { limit?: number; cursor?: string } = {}) => {
+    const p = new URLSearchParams();
+    if (query.limit) p.set("limit", String(query.limit));
+    if (query.cursor) p.set("cursor", query.cursor);
+    const qs = p.toString();
+    return request<DeploysResponse>(
       "GET",
-      `/api/v1/services/${encodeURIComponent(stack)}/deploys${limit ? `?limit=${limit}` : ""}`,
-    ),
+      `/api/v1/services/${encodeURIComponent(stack)}/deploys${qs ? `?${qs}` : ""}`,
+    );
+  },
   /**
    * One page of logs, newest-first.
    *

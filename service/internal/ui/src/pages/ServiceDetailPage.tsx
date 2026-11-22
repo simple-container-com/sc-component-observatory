@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
-import { ArrowLeft, ExternalLink, RefreshCw, Search } from "lucide-react";
+import { ArrowLeft, ChevronRight, ExternalLink, RefreshCw, Search } from "lucide-react";
 import { api, describeError } from "@/api/client";
 import type { ConfigChange, ConfigDiff, DeployEvent } from "@/api/types";
 import { ErrorBox, HealthBadge, Pill, Spinner, exact, relTime } from "@/components/bits";
@@ -141,46 +141,157 @@ export function ServiceDetailPage() {
   );
 }
 
+/** Rows per timeline page. Matches the backend's own default. */
+const DEPLOY_PAGE = 20;
+
+/**
+ * Open/closed state for a collapsible card, persisted per key.
+ *
+ * Persisted because the alternative is worse than it sounds: an
+ * operator comparing two services navigates between detail pages
+ * repeatedly, and a card that springs back open every time is a card
+ * they collapse every time. localStorage access is wrapped — a blocked
+ * store (private mode, a locked-down browser) must degrade to a working
+ * default, never throw inside a render.
+ */
+function useCollapsed(key: string, defaultOpen: boolean) {
+  const [open, setOpen] = useState(() => {
+    try {
+      const v = localStorage.getItem(key);
+      return v === null ? defaultOpen : v === "1";
+    } catch {
+      return defaultOpen;
+    }
+  });
+  return [
+    open,
+    (next: boolean) => {
+      setOpen(next);
+      try {
+        localStorage.setItem(key, next ? "1" : "0");
+      } catch {
+        /* nothing to do; the choice just won't outlive the page */
+      }
+    },
+  ] as const;
+}
+
 /**
  * Deploy timeline with, per row, what changed since the deploy before
- * it.
+ * it. Collapsible, and paged.
  *
- * Its own query: the diff costs the backend one snapshot read per row,
- * so the detail payload carries the timeline WITHOUT diffs and this
- * fetches the annotated version alongside it. `fallback` is that
- * diff-less list — if the diff query fails, the timeline still renders
- * and the failure is reported in place of the diffs, rather than the
- * whole card disappearing over an additive feature.
+ * Its own query: the diff costs the backend TWO snapshot reads per row
+ * (one memoized away within a page), so the detail payload carries the
+ * timeline WITHOUT diffs and this fetches the annotated version
+ * alongside it. `fallback` is that diff-less list — if the diff query
+ * fails, the timeline still renders and the failure is reported in
+ * place of the diffs, rather than the whole card disappearing over an
+ * additive feature.
+ *
+ * Collapsing DISABLES the query rather than just hiding its output.
+ * Same discipline as the logs panel: a card whose every page costs real
+ * object reads should not be paying for them while rolled up. The
+ * consequence is deliberate — a collapsed header counts deploys from
+ * the free `fallback` list, so the number can lag the paged `total` by
+ * whatever the detail payload's own cap (50) hides.
  */
 function DeployTimeline({ stack, fallback }: { stack: string; fallback: DeployEvent[] }) {
-  const q = useQuery({
+  const [open, setOpen] = useCollapsed("obs.deploys.open", true);
+
+  const q = useInfiniteQuery({
     queryKey: ["deploys", stack],
-    queryFn: () => api.deploys(stack),
-    refetchInterval: 60_000,
+    initialPageParam: undefined as string | undefined,
+    queryFn: ({ pageParam }) => api.deploys(stack, { limit: DEPLOY_PAGE, cursor: pageParam }),
+    /* The cursor is opaque and comes straight from the server. Pages
+       are stable boundaries, not offsets, so a deploy landing between
+       two page fetches cannot shift what the next page returns. */
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    enabled: open,
+    refetchInterval: open ? 60_000 : false,
+    refetchOnWindowFocus: false,
   });
-  const rows = q.data?.deploys ?? fallback;
+
+  const pages = q.data?.pages ?? [];
+  const paged = pages.flatMap((p) => p.deploys);
+  const total = pages[0]?.total;
+  const capped = pages.find((p) => p.capped);
+
+  // The diff query failed and there is nothing paged: fall back to the
+  // diff-less list from the detail payload rather than showing an empty
+  // timeline for a service that has deploys.
+  const usingFallback = paged.length === 0 && !!q.error;
+  const rows = usingFallback ? fallback : paged;
+
+  const count = open && total !== undefined ? total : fallback.length;
 
   return (
     <div className="card p-4">
-      <div className="flex items-center gap-2">
+      <button
+        type="button"
+        className="flex w-full items-center gap-2 text-left"
+        onClick={() => setOpen(!open)}
+        aria-expanded={open}
+      >
+        <ChevronRight className={"h-3.5 w-3.5 shrink-0 text-faint transition-transform " + (open ? "rotate-90" : "")} />
         <h2 className="text-sm font-medium">Deploy history</h2>
-        {q.isFetching && !q.data && <span className="text-xs text-faint">loading diffs…</span>}
-      </div>
+        {count > 0 && (
+          <span className="text-xs text-faint tnum">
+            {count} deploy{count === 1 ? "" : "s"}
+          </span>
+        )}
+        {/* Collapsed, the latest version is the one fact worth keeping
+            on screen — it is what the rest of the page is about. */}
+        {!open && fallback[0] && <span className="font-mono text-xs text-faint">latest {fallback[0].version}</span>}
+        {open && q.isFetching && !q.data && <span className="text-xs text-faint">loading diffs…</span>}
+      </button>
 
-      {q.error && (
-        <p className="mt-2 text-xs text-warn">
-          Diffs unavailable: {describeError(q.error)}
-        </p>
-      )}
+      {!open ? null : (
+        <>
+          {q.error && (
+            <p className="mt-2 text-xs text-warn">
+              Diffs unavailable: {describeError(q.error)}
+              {usingFallback && " — showing the timeline without them"}
+            </p>
+          )}
 
-      {rows.length === 0 ? (
-        <p className="mt-2 text-sm text-muted">No deploys recorded yet.</p>
-      ) : (
-        <ul className="mt-3 divide-y divide-line/60">
-          {rows.map((ev) => (
-            <DeployRow key={ev.id} ev={ev} />
-          ))}
-        </ul>
+          {capped?.cap_reason && (
+            <p className="mt-3 rounded border border-warn/40 bg-warn/5 p-2 text-xs text-warn">{capped.cap_reason}</p>
+          )}
+
+          {q.isLoading ? (
+            <Spinner label="Reading deploy history…" />
+          ) : rows.length === 0 ? (
+            <p className="mt-2 text-sm text-muted">No deploys recorded yet.</p>
+          ) : (
+            <ul className="mt-3 divide-y divide-line/60">
+              {rows.map((ev) => (
+                <DeployRow key={ev.id} ev={ev} />
+              ))}
+            </ul>
+          )}
+
+          {q.hasNextPage ? (
+            <button
+              type="button"
+              className="btn mt-3 w-full"
+              onClick={() => void q.fetchNextPage()}
+              disabled={q.isFetchingNextPage}
+            >
+              {q.isFetchingNextPage
+                ? "Loading…"
+                : `Load older deploys${total ? ` — ${rows.length} of ${total} shown` : ""}`}
+            </button>
+          ) : usingFallback ? (
+            /* NOT "the whole history": the fallback list is the detail
+               payload's own newest-50, and saying otherwise would turn
+               a degraded read into a false claim about the service. */
+            <p className="mt-3 text-xs text-faint">Up to the newest 50 deploys, without diffs.</p>
+          ) : rows.length > 0 && !capped ? (
+            <p className="mt-3 text-xs text-faint">
+              {rows.length === 1 ? "The only recorded deploy." : `All ${rows.length} recorded deploys.`}
+            </p>
+          ) : null}
+        </>
       )}
     </div>
   );

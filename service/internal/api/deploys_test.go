@@ -4,22 +4,30 @@
 package api
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/simple-container-com/sc-component-observatory/service/internal/configdiff"
+	"github.com/simple-container-com/sc-component-observatory/service/internal/telemetry"
 )
 
 // deploysResponse mirrors the wire shape. Declared here rather than
 // reusing the handler's own types so a field rename shows up as a test
 // failure instead of silently agreeing with itself.
 type deploysResponse struct {
-	Stack   string `json:"stack"`
-	Count   int    `json:"count"`
-	Deploys []struct {
+	Stack      string `json:"stack"`
+	Count      int    `json:"count"`
+	Total      int    `json:"total"`
+	NextCursor string `json:"next_cursor"`
+	Capped     bool   `json:"capped"`
+	CapReason  string `json:"cap_reason"`
+	Deploys    []struct {
 		ID             string           `json:"id"`
 		Version        string           `json:"version"`
 		ShortCommit    string           `json:"short_commit"`
@@ -295,6 +303,145 @@ func TestDeploys_LimitValidation(t *testing.T) {
 	// and refusing that is less useful than serving the maximum page.
 	if _, code := getDeploys(t, m, "/api/v1/services/svc--staging/deploys?limit=100000"); code != http.StatusOK {
 		t.Errorf("an over-cap limit should be clamped, got %d", code)
+	}
+}
+
+// TestDeploys_CursorWalkCoversEveryDeployExactlyOnce is the whole
+// pagination contract as one property: following `next_cursor` to
+// exhaustion yields the full history, newest-first, with no duplicate
+// and no gap.
+//
+// It is also the regression test for the hazard the FIXED test clock
+// here makes unavoidable — every seeded deploy shares one millisecond,
+// so a cursor that excluded only the previous PAGE's ids would re-serve
+// it forever. That is not merely a test artefact: deploy timestamps come
+// from the deploying CI's clock, and a coarse one produces exactly this.
+func TestDeploys_CursorWalkCoversEveryDeployExactlyOnce(t *testing.T) {
+	cfg, _ := newCfg()
+	m := mux(cfg)
+	bodies := make([]map[string]any, 0, 7)
+	for i := 1; i <= 7; i++ {
+		bodies = append(bodies, registerBodyWithConfig("svc--staging", fmt.Sprintf("v%d", i), 128*i))
+	}
+	seedDeploys(t, m, "svc--staging", bodies...)
+
+	var seen []string
+	path := "/api/v1/services/svc--staging/deploys?limit=3"
+	for page := 1; ; page++ {
+		if page > 10 {
+			t.Fatalf("the cursor walk did not terminate: %v", seen)
+		}
+		resp, code := getDeploys(t, m, path)
+		if resp == nil {
+			t.Fatalf("page %d: HTTP %d", page, code)
+		}
+		if resp.Total != 7 {
+			t.Errorf("page %d reports total=%d, want the whole history (7)", page, resp.Total)
+		}
+		if resp.Capped {
+			t.Errorf("page %d claims a scan cap on a 7-deploy history: %s", page, resp.CapReason)
+		}
+		for _, d := range resp.Deploys {
+			seen = append(seen, d.Version)
+		}
+		if resp.NextCursor == "" {
+			break
+		}
+		path = "/api/v1/services/svc--staging/deploys?limit=3&cursor=" + url.QueryEscape(resp.NextCursor)
+	}
+
+	want := []string{"v7", "v6", "v5", "v4", "v3", "v2", "v1"}
+	if strings.Join(seen, ",") != strings.Join(want, ",") {
+		t.Errorf("cursor walk yielded %v, want %v", seen, want)
+	}
+}
+
+// TestDeploys_OffPageBaselineSurvivesPaging — the off-page baseline
+// property (see TestDeploys_PageBoundaryUsesAnOffPageBaseline) must hold
+// on page TWO as well. The newest row of a later page has a predecessor
+// on the page before it, so indexing the baseline relative to the page
+// instead of the history would make every page's first row claim
+// "nothing to compare against".
+func TestDeploys_OffPageBaselineSurvivesPaging(t *testing.T) {
+	cfg, _ := newCfg()
+	m := mux(cfg)
+	bodies := make([]map[string]any, 0, 4)
+	for i, mem := range []int{128, 256, 512, 1024} {
+		bodies = append(bodies, registerBodyWithConfig("svc--staging", fmt.Sprintf("v%d", i+1), mem))
+	}
+	seedDeploys(t, m, "svc--staging", bodies...)
+
+	first, _ := getDeploys(t, m, "/api/v1/services/svc--staging/deploys?limit=2")
+	if first == nil || first.NextCursor == "" {
+		t.Fatalf("precondition: a 4-deploy history paged by 2 must offer a cursor: %+v", first)
+	}
+	second, code := getDeploys(t, m,
+		"/api/v1/services/svc--staging/deploys?limit=2&cursor="+url.QueryEscape(first.NextCursor))
+	if second == nil {
+		t.Fatalf("page 2: HTTP %d", code)
+	}
+	if len(second.Deploys) != 2 || second.Deploys[0].Version != "v2" {
+		t.Fatalf("unexpected page 2: %+v", second.Deploys)
+	}
+	// v2 against v1: 256 → 128, computed from a snapshot that is not on
+	// this page.
+	top := second.Deploys[0]
+	if top.Diff.Unavailable != "" {
+		t.Fatalf("page 2's newest row lost its baseline: %s", top.Diff.Unavailable)
+	}
+	if len(top.Diff.Compute) != 1 || top.Diff.Compute[0].Previous != "128" || top.Diff.Compute[0].Current != "256" {
+		t.Errorf("page 2 diffed against the wrong baseline: %+v", top.Diff.Compute)
+	}
+	// And the oldest deploy overall still says so, rather than blaming
+	// the page.
+	oldest := second.Deploys[1]
+	if !strings.Contains(oldest.Diff.Unavailable, "first recorded deploy") {
+		t.Errorf("the oldest row should name itself the first deploy, got %q", oldest.Diff.Unavailable)
+	}
+	if second.NextCursor != "" {
+		t.Errorf("the last page must not offer a cursor, got %q", second.NextCursor)
+	}
+}
+
+// TestDeploys_BadCursorIs400 — a malformed cursor must not silently
+// reset to the newest page. A reader who clicked "load older" and got
+// page one again has no way to tell that from "nothing older exists".
+func TestDeploys_BadCursorIs400(t *testing.T) {
+	cfg, _ := newCfg()
+	m := mux(cfg)
+	seedDeploys(t, m, "svc--staging", registerBodyWithConfig("svc--staging", "v1", 512))
+
+	for _, bad := range []string{"not-base64!!", "YWJj", base64.RawURLEncoding.EncodeToString([]byte(`{"b":0}`))} {
+		rr := do(t, m, "GET", "/api/v1/services/svc--staging/deploys?cursor="+url.QueryEscape(bad),
+			jwtFor(t, "operator", ""), nil)
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("cursor=%q: want 400, got %d %s", bad, rr.Code, rr.Body.String())
+		}
+	}
+}
+
+// TestDeploys_CursorPastTheEndIsAnEmptyPage — a tenant scrubbed between
+// two page reads leaves a cursor pointing past the end of history. That
+// is an empty final page, not a 500 and not a silent restart.
+func TestDeploys_CursorPastTheEndIsAnEmptyPage(t *testing.T) {
+	cfg, _ := newCfg()
+	m := mux(cfg)
+	seedDeploys(t, m, "svc--staging", registerBodyWithConfig("svc--staging", "v1", 512))
+
+	// A boundary one day older than anything recorded.
+	stale := telemetry.Cursor{BeforeMS: now0.Add(-24 * time.Hour).UnixMilli()}.Encode()
+	resp, code := getDeploys(t, m, "/api/v1/services/svc--staging/deploys?cursor="+url.QueryEscape(stale))
+	if resp == nil {
+		t.Fatalf("HTTP %d", code)
+	}
+	if resp.Count != 0 || len(resp.Deploys) != 0 {
+		t.Errorf("want an empty page, got %d rows", resp.Count)
+	}
+	if resp.NextCursor != "" {
+		t.Error("an empty page must not offer another cursor")
+	}
+	if resp.Total != 1 {
+		t.Errorf("total must stay the whole history, got %d", resp.Total)
 	}
 }
 
