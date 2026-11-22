@@ -1,4 +1,11 @@
-import type { DeploysResponse, ServiceDetail, ServicesResponse, SessionInfo } from "./types";
+import type {
+  DeploysResponse,
+  LogsQuery,
+  LogsResponse,
+  ServiceDetail,
+  ServicesResponse,
+  SessionInfo,
+} from "./types";
 
 /**
  * Every error path on the Go side returns parseable JSON with an
@@ -56,6 +63,27 @@ export const api = {
       "GET",
       `/api/v1/services/${encodeURIComponent(stack)}/deploys${limit ? `?limit=${limit}` : ""}`,
     ),
+  /**
+   * One page of logs, newest-first.
+   *
+   * Never called on a timer and never on a keystroke: every call is a
+   * real CloudWatch scan with a real bill, so the panel fetches on an
+   * explicit submit and on "load older" only.
+   */
+  logs: (stack: string, query: LogsQuery = {}) => {
+    const p = new URLSearchParams();
+    if (query.q) p.set("q", query.q);
+    if (query.minutes) p.set("minutes", String(query.minutes));
+    if (query.start) p.set("start", query.start);
+    if (query.end) p.set("end", query.end);
+    if (query.limit) p.set("limit", String(query.limit));
+    if (query.cursor) p.set("cursor", query.cursor);
+    const qs = p.toString();
+    return request<LogsResponse>(
+      "GET",
+      `/api/v1/services/${encodeURIComponent(stack)}/logs${qs ? `?${qs}` : ""}`,
+    );
+  },
   removeService: (stack: string) =>
     request<{ deleted: string }>("DELETE", `/api/v1/services/${encodeURIComponent(stack)}`),
 };

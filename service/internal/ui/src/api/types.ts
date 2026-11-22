@@ -146,3 +146,80 @@ export interface SessionInfo {
   authenticated: boolean;
   password_set: boolean;
 }
+
+/** One log line. */
+export interface LogEvent {
+  at: string;
+  message: string;
+  /** Log stream / pod / container the line came from. */
+  stream?: string;
+  /** The handle that produced it — a page can merge several groups. */
+  source?: string;
+  id?: string;
+  /** Cut to the per-message byte cap; the rest of the line is not here. */
+  truncated?: boolean;
+}
+
+/**
+ * One page of logs, plus everything needed to say honestly what was and
+ * was not read.
+ *
+ * Four fields are load-bearing and must always be rendered when set,
+ * for the same reason `ConfigDiff.unavailable` is:
+ *
+ * - `unavailable` — there was nothing to query, or nothing could be
+ *   queried. NOT "the service was quiet". When set, `events` is empty
+ *   by construction.
+ * - `capped` + `cap_reason` — a budget stopped the scan, so these are
+ *   the newest events of the part of the window that was scanned, not
+ *   of the window. A capped page that renders like a complete one is
+ *   the failure this component exists to prevent.
+ * - `warnings` — per-source failures that did not sink the query (one
+ *   log group denied out of three). Dropping them would present a
+ *   partial answer as complete.
+ * - `inferred` — the handles were guessed from naming conventions, so
+ *   an empty page may be a wrong lookup rather than a quiet service.
+ *
+ * `events`, `queried` and `warnings` are always arrays — the Go side
+ * guarantees it.
+ */
+export interface LogsResponse {
+  stack: string;
+  /** The cloud implementation that served this, so its limits apply. */
+  provider?: string;
+  /** The window ACTUALLY searched. Echoed so the UI labels the truth. */
+  window_start: string;
+  window_end: string;
+  /** Newest-first. */
+  events: LogEvent[];
+  /** Continues OLDER than this page. Absent means the window is done. */
+  next_cursor?: string;
+  capped: boolean;
+  cap_reason?: string;
+  /** What the query cost, surfaced to whoever triggered the scan. */
+  scanned: number;
+  calls: number;
+  /** The concrete handles read — the first question when a search is empty. */
+  queried: string[];
+  warnings: string[];
+  unavailable?: string;
+  inferred: boolean;
+  filter?: string;
+}
+
+/**
+ * Log query parameters.
+ *
+ * `cursor` moves only the window's END, so a caller paging backwards
+ * MUST resend the same window — hence `start`/`end` alongside it rather
+ * than `minutes`, which is relative to now and would drift the window
+ * under the reader between pages.
+ */
+export interface LogsQuery {
+  q?: string;
+  minutes?: number;
+  start?: string;
+  end?: string;
+  limit?: number;
+  cursor?: string;
+}

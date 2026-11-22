@@ -24,6 +24,21 @@
 //	METADATA_TYPE                    colocated               (default; only one in slice 1)
 //	PORT                             HTTP port               (default 8080)
 //
+// Telemetry knobs — all optional, and all of them LOWER a limit rather
+// than raise one. The defaults bound a real CloudWatch bill and a real
+// Lambda timeout, so the safe direction to move them is down:
+//
+//	TELEMETRY_AWS_REGION             fallback region for handles that carry none
+//	TELEMETRY_AWS_ACCESS_KEY/_SECRET_KEY  cross-account only; normally absent,
+//	                                 because the execution role is granted
+//	                                 the log-read actions directly
+//	LOGS_DEFAULT_WINDOW_MINUTES      lookback when the caller names none (15)
+//	LOGS_MAX_WINDOW_HOURS            widest window accepted; wider is REFUSED (48)
+//	LOGS_PAGE_LIMIT / _MAX_PAGE_LIMIT  events per page (200 / 500)
+//	LOGS_MAX_EVENTS_SCANNED          scan cap per request
+//	LOGS_MAX_CALLS                   CloudWatch calls per request
+//	LOGS_MAX_RESPONSE_KB             response-size cap
+//
 // Startup is fail-fast on anything that would otherwise produce a
 // service that looks healthy and answers 401 or 500 to everything —
 // the first SC Component spent real time on exactly that class of
@@ -48,6 +63,8 @@ import (
 	"github.com/simple-container-com/sc-component-observatory/service/internal/health"
 	"github.com/simple-container-com/sc-component-observatory/service/internal/registry"
 	"github.com/simple-container-com/sc-component-observatory/service/internal/storage"
+	"github.com/simple-container-com/sc-component-observatory/service/internal/telemetry"
+	"github.com/simple-container-com/sc-component-observatory/service/internal/telemetry/awsprov"
 	"github.com/simple-container-com/sc-component-observatory/service/internal/ui"
 )
 
@@ -159,6 +176,27 @@ func run() error {
 	mux.Handle("POST /api/v1/scheduler/healthcheck/tick", auth(http.HandlerFunc(healthCfg.Tick)))
 	mux.Handle("GET /api/v1/services/{stack}/health", auth(http.HandlerFunc(healthCfg.History)))
 
+	// Telemetry. One provider per cloud, selected per service by the
+	// `cloud` its record carries; a cloud with no provider answers with
+	// a reason, never with an empty page.
+	logsCfg := &api.LogsConfig{
+		Registry:      reg,
+		Providers:     buildProviders(ctx),
+		DefaultWindow: time.Duration(envInt("LOGS_DEFAULT_WINDOW_MINUTES", 15)) * time.Minute,
+		MaxWindow:     time.Duration(envInt("LOGS_MAX_WINDOW_HOURS", 48)) * time.Hour,
+		DefaultLimit:  envInt("LOGS_PAGE_LIMIT", 200),
+		MaxLimit:      envInt("LOGS_MAX_PAGE_LIMIT", 500),
+		Budget: telemetry.Budget{
+			// Left at the provider's defaults unless the operator
+			// overrides: these bound a real CloudWatch bill and a real
+			// Lambda timeout, and the safe direction is down.
+			MaxEventsScanned: envInt("LOGS_MAX_EVENTS_SCANNED", 0),
+			MaxCalls:         envInt("LOGS_MAX_CALLS", 0),
+			MaxBytes:         envInt("LOGS_MAX_RESPONSE_KB", 0) * 1024,
+		},
+	}
+	mux.Handle("GET /api/v1/services/{stack}/logs", auth(http.HandlerFunc(logsCfg.Logs)))
+
 	// Embedded SPA last, on the catch-all, so it cannot shadow an API
 	// route. A missing dist is a warning rather than a failure: a
 	// Go-only change should not require having run npm, and an operator
@@ -177,6 +215,7 @@ func run() error {
 		"starting sc-component-observatory",
 		"version", version, "commit", commit,
 		"storage", location, "metadata", metaType,
+		"telemetry_clouds", logsCfg.Providers.Clouds(),
 		"operator_password_set", operatorPassword != "",
 		"self_url", os.Getenv("OBSERVATORY_SELF_URL"),
 		"port", port,
@@ -216,6 +255,39 @@ func envInt(name string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+// buildProviders assembles the telemetry providers this deployment can
+// serve.
+//
+// A provider that cannot be built is a WARNING, not a boot failure. The
+// registry, the deploy timeline and the health sweep are useful without
+// telemetry, and taking the whole dashboard down over a log-read
+// permission the operator has not granted yet would be the component
+// punishing its own adopter. The absence then surfaces per request, in
+// the response, as a reason.
+func buildProviders(ctx context.Context) telemetry.Set {
+	set := telemetry.Set{}
+
+	// AWS_REGION is set by the Lambda runtime; STORAGE_REGION is the
+	// operator's explicit choice for the component's own bucket and the
+	// best available guess otherwise. Handles carry their own region
+	// when the deploy recorded one, so this is only the fallback.
+	region := envOr("TELEMETRY_AWS_REGION", envOr("AWS_REGION", envOr("STORAGE_REGION", "eu-central-1")))
+	awsProv, err := awsprov.New(ctx, awsprov.Config{
+		DefaultRegion: region,
+		// Normally empty: observatory reads its own account through the
+		// execution role the template granted. Present for the
+		// cross-account case, which needs a key by construction.
+		AccessKey: os.Getenv("TELEMETRY_AWS_ACCESS_KEY"),
+		SecretKey: os.Getenv("TELEMETRY_AWS_SECRET_KEY"),
+	})
+	if err != nil {
+		slog.Warn("AWS telemetry provider unavailable", "err", err)
+	} else {
+		set[registry.CloudAWS] = awsProv
+	}
+	return set
 }
 
 // buildObjectStore constructs the object store from env and returns a
