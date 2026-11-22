@@ -65,6 +65,75 @@ func TestDeriveSources_MetricHandleStaysAPrefix(t *testing.T) {
 	}
 }
 
+// TestDeriveSources_ECSFargate pins all three ECS names against the
+// live staging account (checked 2026-11-22 for `forge-baas--staging`:
+// log group `/ecs/forge-baas--staging-staging`, cluster
+// `forge-baas_staging-staging-cluster`, service
+// `forge-baas_staging-staging-svc`).
+//
+// The doubled environment and the `--`→`_` collapse are both real; see
+// ecsSources for why. The first cut of this branch derived
+// `/ecs/forge-baas--staging` with `ClusterName: forge-baas--staging`
+// and no ServiceName, which matches no log group and no metric — and
+// would have rendered as a service with nothing to say.
+func TestDeriveSources_ECSFargate(t *testing.T) {
+	got := DeriveSources("forge-baas--staging", "ecs-fargate", "eu-central-1")
+	if len(got) != 2 {
+		t.Fatalf("want 2 sources, got %d: %+v", len(got), got)
+	}
+
+	logs := logRef(t, got)
+	if logs.Ref != "/ecs/forge-baas--staging-staging" {
+		t.Errorf("log group = %q", logs.Ref)
+	}
+	if logs.Dims["match"] == "prefix" {
+		t.Error("the ECS log group is created with an explicit awslogs-group, so it is EXACT; a prefix hides a missing group as an empty match")
+	}
+	if logs.Region != "eu-central-1" {
+		t.Errorf("region not carried: %q", logs.Region)
+	}
+
+	var metrics *TelemetrySource
+	for i := range got {
+		if got[i].Kind == KindCloudWatchMetrics {
+			metrics = &got[i]
+		}
+	}
+	if metrics == nil {
+		t.Fatal("no metrics source derived for an ECS service")
+	}
+	if metrics.Ref != "AWS/ECS" {
+		t.Errorf("namespace = %q", metrics.Ref)
+	}
+	if c := metrics.Dims["ClusterName"]; c != "forge-baas_staging-staging-cluster" {
+		t.Errorf("ClusterName = %q", c)
+	}
+	// Both, or nothing matches: AWS/ECS publishes every metric under
+	// {ClusterName, ServiceName}, and the metric provider keeps only
+	// dimension sets whose key set EXACTLY equals the filter's.
+	if s := metrics.Dims["ServiceName"]; s != "forge-baas_staging-staging-svc" {
+		t.Errorf("ServiceName = %q", s)
+	}
+}
+
+// TestDeriveSources_ECSWithoutEnvDerivesNothing — the cluster name is
+// built FROM the environment, so a stack name it cannot be split out of
+// yields no handles rather than approximate ones.
+func TestDeriveSources_ECSWithoutEnvDerivesNothing(t *testing.T) {
+	if got := DeriveSources("forge-baas", "ecs-fargate", "eu-central-1"); len(got) != 0 {
+		t.Errorf("derived %+v from a stack name with no environment", got)
+	}
+}
+
+// TestDeriveSources_CloudComposeIsNotATemplate — `cloud-compose` is the
+// stack TYPE, and the same type deploys to GKE and k8s. Treating it as
+// ECS would hand a Kubernetes workload CloudWatch handles.
+func TestDeriveSources_CloudComposeIsNotATemplate(t *testing.T) {
+	if got := DeriveSources("svc--staging", "cloud-compose", "eu-central-1"); len(got) != 0 {
+		t.Errorf("cloud-compose derived %+v", got)
+	}
+}
+
 func TestDeriveSources_UnknownTemplateDerivesNothing(t *testing.T) {
 	for _, tpl := range []string{"yc-container", "kubernetes", "", "something-new"} {
 		if got := DeriveSources("svc--staging", tpl, ""); len(got) != 0 {

@@ -70,17 +70,60 @@ func TestInferSources_LambdaLogGroupIsExact(t *testing.T) {
 	}
 }
 
-// TestInferSources_Fargate — ECS logs to /ecs/<family>.
+// TestInferSources_Fargate pins the three ECS names against the live
+// staging account (checked 2026-11-22 for `forge-baas--staging`).
+//
+// The expected strings look mangled and are not: the environment
+// appears TWICE because sc-plugin-aws appends it to a stack name that
+// already ends in `--<env>`, and the `--` survives in the log group but
+// collapses to `_` in the cluster and service names because those go
+// through its `awsResName`. The first cut of this branch guessed all
+// three (`/ecs/svc--staging`, `ClusterName: svc--staging`, no
+// ServiceName at all) and would have matched nothing.
 func TestInferSources_Fargate(t *testing.T) {
-	got := InferSources("svc--staging", "ecs-fargate", "eu-west-1")
+	got := InferSources("forge-baas--staging", "ecs-fargate", "eu-central-1")
 	if len(got) != 2 {
 		t.Fatalf("want 2 sources, got %d", len(got))
 	}
-	if got[0].Ref != "/ecs/svc--staging" {
-		t.Errorf("ecs log group: %q", got[0].Ref)
+	if got[0].Kind != KindCloudWatchLogs || got[0].Ref != "/ecs/forge-baas--staging-staging" {
+		t.Errorf("ecs log group: %+v", got[0])
 	}
-	if got[1].Ref != "AWS/ECS" || got[1].Dims["ClusterName"] != "svc--staging" {
-		t.Errorf("ecs metrics: %+v", got[1])
+	// Exact, not a prefix: the template creates the group with an
+	// explicit `awslogs-group`, so there is no Pulumi suffix to resolve
+	// and a missing group should surface by name.
+	if got[0].Dims["match"] == "prefix" {
+		t.Error("the ECS log group name is exact; marking it a prefix hides a missing group behind an empty match")
+	}
+	if got[1].Kind != KindCloudWatchMetrics || got[1].Ref != "AWS/ECS" {
+		t.Fatalf("ecs metrics source wrong: %+v", got[1])
+	}
+	if c := got[1].Dims["ClusterName"]; c != "forge-baas_staging-staging-cluster" {
+		t.Errorf("ClusterName: %q", c)
+	}
+	// Both dimensions, or none match: the provider keeps only dimension
+	// sets whose key set EXACTLY equals the filter's, and every AWS/ECS
+	// metric is published under {ClusterName, ServiceName}.
+	if s := got[1].Dims["ServiceName"]; s != "forge-baas_staging-staging-svc" {
+		t.Errorf("ServiceName: %q", s)
+	}
+}
+
+// TestInferSources_FargateWithoutEnv — a stack name with no `--<env>`
+// cannot produce a cluster name, and half a name matches nothing. No
+// handles is the honest answer.
+func TestInferSources_FargateWithoutEnv(t *testing.T) {
+	if got := InferSources("forge-baas", "ecs-fargate", "eu-central-1"); got != nil {
+		t.Errorf("want no sources without an environment, got %+v", got)
+	}
+}
+
+// TestInferSources_CloudComposeIsNotAnECSTemplate — `cloud-compose` is
+// a TYPE and it deploys to GKE and k8s too. Accepting it as a template
+// here would hand a Kubernetes workload CloudWatch handles, which is
+// the wrong-resource failure this component exists to prevent.
+func TestInferSources_CloudComposeIsNotAnECSTemplate(t *testing.T) {
+	if got := InferSources("svc--staging", "cloud-compose", "eu-central-1"); got != nil {
+		t.Errorf("cloud-compose must not infer AWS handles, got %+v", got)
 	}
 }
 

@@ -81,6 +81,20 @@ var catalogues = map[string][]metricDef{
 	"AWS/ECS": {
 		{Name: "CPUUtilization", Stat: "Average", Unit: "Percent"},
 		{Name: "MemoryUtilization", Stat: "Average", Unit: "Percent"},
+		// LiveTaskCount is the running replica count, and it is the one
+		// ECS metric that answers a question the Lambda catalogue cannot
+		// — "is it running, and how many of it".
+		//
+		// Average, not Sum: it is a GAUGE, and statFor's `*Count` →
+		// Sum heuristic (right for RequestCount, right for
+		// Invocations) would add one bucket's task count to the next
+		// one's and draw a service holding one task as a rising line.
+		// Being in this table is what keeps that heuristic away from
+		// it. Confirmed listed under {ClusterName, ServiceName} on the
+		// live staging cluster 2026-11-22, alongside the two
+		// utilizations — without Container Insights enabled, which the
+		// per-task metrics in ECS/ContainerInsights would need.
+		{Name: "LiveTaskCount", Stat: "Average", Unit: "Count"},
 	},
 	"AWS/ApplicationELB": {
 		{Name: "RequestCount", Stat: "Sum", Unit: "Count"},

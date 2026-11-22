@@ -98,3 +98,89 @@ func TestDeriveCommit_PrefersBusHeader(t *testing.T) {
 		t.Errorf("with nothing available: deriveCommit = %q, want empty", got)
 	}
 }
+
+// composeDescriptor is a `cloud-compose` consumer's client descriptor in
+// the shape api actually packs it: the operator's own config two levels
+// down, under a capitalized outer key, with `template` and `type` at the
+// top. Mirrors what forge-baas sends.
+func composeDescriptor() map[string]any {
+	return map[string]any{
+		"template": "ecs-fargate",
+		"type":     "cloud-compose",
+		"parent":   "forge/infra",
+		"Config": map[string]any{
+			"config": map[string]any{
+				"domain": "baas.simple-forge.com",
+				"uses":   []any{"mongodb", "my-backup", "my-observatory"},
+			},
+		},
+	}
+}
+
+// TestDeriveTemplate_ReadsTheConsumerNotTheComponent is the regression
+// test for the defect that would have made the first ECS tenant useless.
+//
+// deriveTemplate used to read `deployTo` out of the COMPONENT's own
+// opaque config — `my-observatory`'s `deployTo: lambda`, which says
+// where the observatory's own Lambda runs. Every tenant therefore
+// registered as `template: lambda`. That is invisible while every
+// tenant IS a Lambda (all six were) and wrong the moment an ECS stack
+// registers: the read-time derivation hands a `lambda` record
+// `<stack>-access-logs` and `AWS/Lambda`, and both panels resolve to
+// nothing at all.
+func TestDeriveTemplate_ReadsTheConsumerNotTheComponent(t *testing.T) {
+	p := NewProcessor(ProcessorConfig{ClientConfig: composeDescriptor()})
+	if got := p.deriveTemplate(composeDescriptor()); got != "ecs-fargate" {
+		t.Errorf("deriveTemplate = %q, want the CONSUMER's template", got)
+	}
+
+	// The component's own config must not be consulted as a fallback:
+	// `deployTo` describes a different stack, so a value from it is a
+	// confident answer about the wrong resource. Empty degrades
+	// honestly — no cloud, no handles, and the dashboard says so.
+	own := &api.ResourceDescriptor{Name: "my-observatory", Type: "sc-observatory"}
+	own.Config.Config = map[string]any{"deployTo": "lambda"}
+	bare := NewProcessor(ProcessorConfig{})
+	if got := bare.deriveTemplate(nil); got != "" {
+		t.Errorf("without a client descriptor: deriveTemplate = %q, want empty", got)
+	}
+	if rec := bare.buildRecord("forge-baas--staging", api.ResourceInput{Descriptor: own},
+		collectorWith(nil), nil, []byte("k")); rec.Template != "" || rec.Cloud != "" || len(rec.Sources) != 0 {
+		t.Errorf("record built from the component's own config: %+v", rec)
+	}
+}
+
+// TestBuildRecord_ECSConsumerGetsECSHandles walks the whole chain the
+// ECS wiring depends on: the consumer's template is read from its
+// descriptor, mapped to AWS, and turned into the three live-verified
+// ECS names.
+func TestBuildRecord_ECSConsumerGetsECSHandles(t *testing.T) {
+	p := NewProcessor(ProcessorConfig{ClientConfig: composeDescriptor()})
+	rec := p.buildRecord("forge-baas--staging", api.ResourceInput{},
+		collectorWith(nil), composeDescriptor(), []byte("fp-key"))
+
+	if rec.Template != "ecs-fargate" || rec.Cloud != CloudAWS {
+		t.Fatalf("template/cloud = %q/%q", rec.Template, rec.Cloud)
+	}
+	if !rec.Inferred {
+		t.Error("Inferred = false; derived handles must render AS a guess")
+	}
+	if rec.EndpointURL != "https://baas.simple-forge.com" {
+		t.Errorf("EndpointURL = %q, want the consumer's own domain", rec.EndpointURL)
+	}
+	var logs, metrics *TelemetrySource
+	for i := range rec.Sources {
+		switch rec.Sources[i].Kind {
+		case KindCloudWatchLogs:
+			logs = &rec.Sources[i]
+		case KindCloudWatchMetrics:
+			metrics = &rec.Sources[i]
+		}
+	}
+	if logs == nil || logs.Ref != "/ecs/forge-baas--staging-staging" {
+		t.Errorf("log handle = %+v", logs)
+	}
+	if metrics == nil || metrics.Dims["ServiceName"] != "forge-baas_staging-staging-svc" {
+		t.Errorf("metric handle = %+v", metrics)
+	}
+}

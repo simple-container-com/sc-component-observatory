@@ -71,23 +71,13 @@ func DeriveSources(stack, template, region string) []TelemetrySource {
 			Dims: map[string]string{"match": "prefix", "FunctionNamePrefix": stack + "-callback"},
 		}}
 
+	// `ecs-fargate` ONLY, deliberately: the Lambda branch above also
+	// accepts a couple of `type:` spellings as a leftover safety net,
+	// but `cloud-compose` must NOT be added here. It is a TYPE, and the
+	// same type deploys to GKE or k8s with a different template — so
+	// accepting it would hand a Kubernetes workload CloudWatch handles.
 	case "ecs-fargate":
-		// ECS task definitions created by sc-plugin-aws log to
-		// `/ecs/<family>`, and the family is the stack name. Left as a
-		// prefix: unlike the Lambda case this has not been checked
-		// against a live cluster, and a prefix that matches nothing says
-		// so out loud where an exact name would read as a read failure.
-		return []TelemetrySource{{
-			Kind:   KindCloudWatchLogs,
-			Ref:    "/ecs/" + stack,
-			Region: region,
-			Dims:   map[string]string{"ClusterName": stack, "match": "prefix"},
-		}, {
-			Kind:   KindCloudWatchMetrics,
-			Ref:    "AWS/ECS",
-			Region: region,
-			Dims:   map[string]string{"ClusterName": stack},
-		}}
+		return ecsSources(stack, region)
 	}
 
 	// Yandex log groups are referenced by id, and k8s namespace/selector
@@ -95,6 +85,93 @@ func DeriveSources(stack, template, region string) []TelemetrySource {
 	// name. Nothing is the honest answer: the reader gets "no telemetry
 	// handles are recorded", not an empty log view.
 	return nil
+}
+
+// ecsSources derives the handles sc-plugin-aws's `ecs-fargate` template
+// creates for a `cloud-compose` stack.
+//
+// Every name below was checked against the live staging account on
+// 2026-11-22 before it shipped, because the first cut of this branch
+// (written from the stack name alone) got all three wrong — and an ECS
+// tenant is exactly the case where a wrong guess is least likely to be
+// noticed, since the panels degrade to "nothing matched" rather than to
+// an error.
+//
+// The rule is one line of sc-plugin-aws and two surprises:
+//
+//	ecsSimpleClusterName := fmt.Sprintf("%s-%s", stack.Name, env)   // ecs_fargate.go:208
+//
+// 1. `stack.Name` ALREADY ENDS IN `--<env>` — it is the same value this
+// package receives as `rec.Stack` (`forge-baas--staging`), and the same
+// one the Lambda branch above appends `-callback` to. So the simple
+// cluster name carries the environment TWICE:
+// `forge-baas--staging-staging`. That doubling is upstream's and is not
+// a typo here.
+//
+// 2. The cluster and service names then go through sc-plugin-aws's
+// `awsResName`, which COLLAPSES the `--` to an underscore — so the ECS
+// names are spelled differently from the log group, which keeps the
+// `--`. Live, for `forge-baas--staging`:
+//
+//	log group  /ecs/forge-baas--staging-staging        (exact: created
+//	                                                    with an explicit
+//	                                                    awslogs-group)
+//	cluster    forge-baas_staging-staging-cluster
+//	service    forge-baas_staging-staging-svc
+//
+// The log group is EXACT for the same reason the Lambda one is: the
+// template passes `awslogs-create-group: true` with an explicit
+// `awslogs-group`, so Pulumi adds no suffix and there is nothing to
+// resolve. AWS/ECS metrics are dimensioned by BOTH `ClusterName` and
+// `ServiceName` (verified: CPUUtilization, MemoryUtilization and
+// LiveTaskCount are listed under exactly that pair), and naming only
+// the cluster would match no metric at all — the metric provider keeps
+// only dimension sets whose key set EXACTLY equals the filter's.
+func ecsSources(stack, region string) []TelemetrySource {
+	env := envOfStack(stack)
+	if env == "" {
+		// Without the environment the cluster name cannot be built, and
+		// a half-built one would match nothing. Returning nothing gets
+		// "no telemetry handles are recorded", which is true.
+		return nil
+	}
+	simple := stack + "-" + env
+	return []TelemetrySource{{
+		Kind:   KindCloudWatchLogs,
+		Ref:    "/ecs/" + simple,
+		Region: region,
+	}, {
+		Kind:   KindCloudWatchMetrics,
+		Ref:    "AWS/ECS",
+		Region: region,
+		Dims: map[string]string{
+			"ClusterName": awsResName(simple, "cluster"),
+			"ServiceName": awsResName(simple, "svc"),
+		},
+	}}
+}
+
+// envOfStack recovers the environment from an SC stack name, which is
+// `<stack>--<env>`.
+//
+// Returns "" when there is no `--`, which is not a parse failure to
+// shrug at: every name in ecsSources is built from the environment, so
+// an unsplittable stack name means no handles rather than approximate
+// ones.
+func envOfStack(stack string) string {
+	if i := strings.LastIndex(stack, "--"); i >= 0 && i+2 < len(stack) {
+		return stack[i+2:]
+	}
+	return ""
+}
+
+// awsResName mirrors sc-plugin-aws's own helper
+// (plugin/internal/ecs_fargate.go:1287) verbatim. Copied rather than
+// imported: this service does not depend on the AWS plugin, and the
+// one-line rule is better duplicated with its source cited than pulled
+// in behind a module boundary.
+func awsResName(name, suffix string) string {
+	return strings.ReplaceAll(name+"-"+suffix, "--", "_")
 }
 
 // WithDerivedSources returns rec with its telemetry handles re-derived
