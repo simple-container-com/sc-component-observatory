@@ -120,6 +120,12 @@ type sourceJSON struct {
 }
 
 func toServiceJSON(r registry.ServiceRecord, now time.Time) serviceJSON {
+	// Same re-derivation the log handler applies, in the one place both
+	// the list and the detail pass through. Without it the dashboard
+	// would display the handles frozen at registration while the log
+	// panel queried this build's — and "which group did you search"
+	// would have two different answers on the same page.
+	r = registry.WithDerivedSources(r)
 	out := serviceJSON{
 		Stack:       r.Stack,
 		Service:     r.Service,

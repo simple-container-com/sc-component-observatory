@@ -80,14 +80,25 @@ func CloudForTemplate(template string) (string, bool) {
 // Returns nil when nothing can be inferred, which is honest: the
 // service renders "no telemetry wired" and an operator knows to look.
 //
-// AWS: SC names a Lambda `<stack>-callback-<suffix>` where the suffix
-// is Pulumi-generated and NOT derivable here. CloudWatch log groups are
-// `/aws/lambda/<function-name>`, so without the suffix the exact group
-// is unknown — but CloudWatch's DescribeLogGroups takes a PREFIX, so
-// `/aws/lambda/<stack>-callback` is a usable handle that the AWS
-// provider resolves to the concrete group at query time. The prefix
-// nature is recorded in Dims so the provider knows to expand it rather
-// than treating it as exact.
+// AWS: SC names a Lambda `<resScope>-callback-<suffix>` where the
+// suffix is Pulumi-generated and NOT derivable here — so the DEFAULT
+// log group `/aws/lambda/<function-name>` would only be reachable by
+// prefix. But sc-plugin-aws never lets the default group be used: it
+// creates `<resScope>-access-logs` with an explicit Name (no Pulumi
+// suffix) and points the function's LoggingConfig.LogGroup at it
+// (sc-plugin-aws/plugin/internal/aws_lambda.go:436-461). `resScope` is
+// the same value the function name is built from, so the group is
+// derivable EXACTLY.
+//
+// This was live-caught 2026-11-22: the first cut emitted the
+// `/aws/lambda/<stack>-callback` prefix, the staging account holds zero
+// `/aws/lambda/*` groups, and every tenant's log query came back "no
+// log group could be resolved".
+//
+// The service re-derives these handles at read time
+// (registry.WithDerivedSources), so the two copies of the convention
+// must agree — but the service's copy is the one that decides, and it
+// can be corrected without redeploying a single tenant.
 func InferSources(stack, template, region string) []TelemetrySource {
 	cloud, ok := CloudForTemplate(template)
 	if !ok {
@@ -113,9 +124,8 @@ func InferSources(stack, template, region string) []TelemetrySource {
 		default:
 			return []TelemetrySource{{
 				Kind:   KindCloudWatchLogs,
-				Ref:    fmt.Sprintf("/aws/lambda/%s-callback", stack),
+				Ref:    fmt.Sprintf("%s-access-logs", stack),
 				Region: region,
-				Dims:   map[string]string{"match": "prefix"},
 			}, {
 				Kind:   KindCloudWatchMetrics,
 				Ref:    "AWS/Lambda",

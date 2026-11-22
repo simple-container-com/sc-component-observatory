@@ -286,9 +286,10 @@ func (p *Provider) Logs(ctx context.Context, q telemetry.LogQuery) (telemetry.Lo
 	}
 
 	var (
-		merged  []telemetry.LogEvent
-		failed  int
-		lastErr error
+		merged   []telemetry.LogEvent
+		failed   int
+		notFound int
+		lastErr  error
 	)
 	for _, t := range targets {
 		page.Queried = append(page.Queried, t.group)
@@ -297,6 +298,9 @@ func (p *Provider) Logs(ctx context.Context, q telemetry.LogQuery) (telemetry.Lo
 		page.Calls += res.calls
 		if err != nil {
 			failed++
+			if isNotFound(err) {
+				notFound++
+			}
 			lastErr = err
 			page.Warnings = append(page.Warnings, fmt.Sprintf("%s: %s", t.group, errText(err)))
 			continue
@@ -313,6 +317,22 @@ func (p *Provider) Logs(ctx context.Context, q telemetry.LogQuery) (telemetry.Lo
 	// warning nobody reads. The most common cause is a missing grant,
 	// and the message carries the AWS text verbatim so it is actionable.
 	if failed == len(targets) {
+		// One exception, and it is not a fault: the groups simply do not
+		// exist. An EXACT handle (the Lambda access-logs group) has no
+		// resolution step to catch that, so the absence arrives here as
+		// a ResourceNotFoundException from the read itself. Reporting
+		// "log query failed" for it would dress a derivation that names
+		// a group nobody created as a broken dashboard.
+		//
+		// ALL of them, not just the last: one denied group alongside one
+		// missing group is still a permissions problem, and softening it
+		// to "unavailable" would hide the grant that needs fixing.
+		if notFound == failed {
+			return page, &telemetry.UnavailableError{Reason: fmt.Sprintf(
+				"no such log group in %s: %s — nothing has ever written there, so the recorded handle may not match what the template created",
+				targets[0].region, strings.Join(page.Queried, ", "),
+			)}
+		}
 		return page, fmt.Errorf("every log group failed to read: %w", lastErr)
 	}
 
@@ -607,6 +627,18 @@ func applyBudgetDefaults(b telemetry.Budget) telemetry.Budget {
 // Error() carries the operation, the request id and the HTTP status on
 // one very long line; the last segment is the part an operator acts on
 // (AccessDeniedException, ResourceNotFoundException).
+// isNotFound reports whether a read failed because the log group does
+// not exist, as opposed to any other reason.
+//
+// Matched on the typed error, not on the message: `errors.As` against
+// cwtypes.ResourceNotFoundException survives AWS rewording its text,
+// and the alternative — a string match on "ResourceNotFound" — would
+// also swallow an IAM denial whose message happened to quote it.
+func isNotFound(err error) bool {
+	var nf *cwtypes.ResourceNotFoundException
+	return errors.As(err, &nf)
+}
+
 func errText(err error) string {
 	s := err.Error()
 	if i := strings.LastIndex(s, ": "); i > 0 && i < len(s)-2 {

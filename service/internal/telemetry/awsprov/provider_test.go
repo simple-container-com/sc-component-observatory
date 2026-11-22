@@ -443,6 +443,71 @@ func TestLogs_TotalFailureIsAnError(t *testing.T) {
 	}
 }
 
+// TestLogs_MissingGroupIsUnavailableNotAFailure. An EXACT handle has no
+// resolution step, so a group that was never created arrives as a
+// ResourceNotFoundException from the read itself. That is the derivation
+// naming a group nobody made — a reason — and reporting it as a failed
+// query would read as a broken dashboard. Live-caught 2026-11-22: every
+// tenant's Lambda logs live in `<stack>-access-logs`, not under
+// `/aws/lambda/`, and the account holds no `/aws/lambda/*` group at all.
+func TestLogs_MissingGroupIsUnavailableNotAFailure(t *testing.T) {
+	f := &fakeCW{
+		groups: []string{"svc--staging-access-logs"},
+		failGroup: map[string]error{
+			"svc--staging-access-logs": &cwtypes.ResourceNotFoundException{
+				Message: aws.String("The specified log group does not exist."),
+			},
+		},
+	}
+	p := newProvider(t, f)
+	q := telemetry.LogQuery{
+		Sources: []registry.TelemetrySource{exactSource("svc--staging-access-logs")},
+		Limit:   10,
+	}
+	window(&q)
+	page, err := p.Logs(context.Background(), q)
+
+	var unav *telemetry.UnavailableError
+	if !errors.As(err, &unav) {
+		t.Fatalf("err = %v (%T), want an UnavailableError", err, err)
+	}
+	if !strings.Contains(unav.Reason, "svc--staging-access-logs") {
+		t.Errorf("reason %q does not name the group that is missing", unav.Reason)
+	}
+	// The group it tried still rides along: "which group did you look
+	// in" is the first question, and the error path is where it is
+	// asked most.
+	if len(page.Queried) != 1 || page.Queried[0] != "svc--staging-access-logs" {
+		t.Errorf("Queried = %v, want the group carried through the error path", page.Queried)
+	}
+}
+
+// TestLogs_MissingAndDeniedTogetherIsStillAFailure — softening a mixed
+// result to "unavailable" would hide the grant that needs fixing.
+func TestLogs_MissingAndDeniedTogetherIsStillAFailure(t *testing.T) {
+	f := &fakeCW{
+		groups: []string{"a-access-logs", "b-access-logs"},
+		failGroup: map[string]error{
+			"a-access-logs": &cwtypes.ResourceNotFoundException{Message: aws.String("gone")},
+			"b-access-logs": errors.New("AccessDeniedException: logs:FilterLogEvents"),
+		},
+	}
+	p := newProvider(t, f)
+	q := telemetry.LogQuery{Sources: []registry.TelemetrySource{
+		exactSource("a-access-logs"), exactSource("b-access-logs"),
+	}, Limit: 10}
+	window(&q)
+	_, err := p.Logs(context.Background(), q)
+
+	var unav *telemetry.UnavailableError
+	if err == nil || errors.As(err, &unav) {
+		t.Fatalf("err = %v, want a hard failure when one of the groups was DENIED", err)
+	}
+	if !strings.Contains(err.Error(), "AccessDenied") {
+		t.Errorf("err = %q, want the denial text so the missing grant is actionable", err)
+	}
+}
+
 // TestLogs_LongMessageTruncatedAndFlagged — one huge line must not eat
 // the page's byte budget, and the cut must be visible.
 func TestLogs_LongMessageTruncatedAndFlagged(t *testing.T) {

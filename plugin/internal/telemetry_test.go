@@ -28,11 +28,16 @@ func TestCloudForTemplate(t *testing.T) {
 	}
 }
 
-// TestInferSources_LambdaUsesPrefixMatch — the Pulumi-generated
-// function suffix is not derivable, so the inferred log-group handle
-// must be a PREFIX and must say so, or the AWS provider will treat it
-// as an exact group name and find nothing.
-func TestInferSources_LambdaUsesPrefixMatch(t *testing.T) {
+// TestInferSources_LambdaLogGroupIsExact — the log group is the one
+// sc-plugin-aws names itself (`<stack>-access-logs`), not the default
+// `/aws/lambda/<function-name>`, which it never lets a function use.
+// The name carries no Pulumi suffix, so the handle is EXACT.
+//
+// This asserts the corrected convention. The first cut emitted the
+// `/aws/lambda/<stack>-callback` prefix and every tenant's log query
+// came back "no log group could be resolved" — the staging account
+// holds zero `/aws/lambda/*` groups. Live-caught 2026-11-22.
+func TestInferSources_LambdaLogGroupIsExact(t *testing.T) {
 	got := InferSources("forge-storage--staging", "lambda", "eu-central-1")
 	if len(got) != 2 {
 		t.Fatalf("want logs+metrics sources, got %d: %+v", len(got), got)
@@ -41,11 +46,11 @@ func TestInferSources_LambdaUsesPrefixMatch(t *testing.T) {
 	if logs.Kind != KindCloudWatchLogs {
 		t.Errorf("first source should be logs, got %q", logs.Kind)
 	}
-	if logs.Ref != "/aws/lambda/forge-storage--staging-callback" {
+	if logs.Ref != "forge-storage--staging-access-logs" {
 		t.Errorf("log group ref: got %q", logs.Ref)
 	}
-	if logs.Dims["match"] != "prefix" {
-		t.Error("an inferred Lambda log group MUST be flagged as a prefix — the Pulumi suffix is unknown")
+	if logs.Dims["match"] == "prefix" {
+		t.Error("the access-logs group name is exact; a prefix match buys a DescribeLogGroups round trip for nothing")
 	}
 	if logs.Region != "eu-central-1" {
 		t.Errorf("region not carried: %q", logs.Region)

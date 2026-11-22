@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -465,6 +466,14 @@ func TestLogs_NoRegistry(t *testing.T) {
 // stripSources re-seeds the registered service without telemetry
 // handles — the "template published none and none could be inferred"
 // case.
+// stripSources leaves the record with nothing to query.
+//
+// Clearing Sources is not enough on its own: the handler re-derives
+// handles for any record whose template has a known naming convention
+// (registry.WithDerivedSources), so a `lambda` record with no sources
+// still gets some. The template has to be one nothing can be derived
+// from — which is also the only way the real "no handles recorded"
+// state is reached now.
 func stripSources(t *testing.T, cfg *LogsConfig) {
 	t.Helper()
 	rec, found, err := cfg.Registry.Get(context.Background(), "svc--staging")
@@ -472,7 +481,46 @@ func stripSources(t *testing.T, cfg *LogsConfig) {
 		t.Fatalf("reseed: found=%v err=%v", found, err)
 	}
 	rec.Sources = nil
+	rec.Template = "yc-container"
 	if err := cfg.Registry.Put(context.Background(), rec); err != nil {
 		t.Fatalf("reseed: %v", err)
+	}
+}
+
+// TestLogs_InferredHandlesAreReDerived — the handler must query this
+// build's naming convention, not the guess frozen into the record at
+// registration time. That is what made correcting the 2026-11-22 Lambda
+// log-group miss a single observatory deploy instead of six tenant
+// redeploys.
+func TestLogs_InferredHandlesAreReDerived(t *testing.T) {
+	cfg, prov := newLogsCfg(t, "aws", true)
+	rec, _, err := cfg.Registry.Get(context.Background(), "svc--staging")
+	if err != nil {
+		t.Fatalf("seed read: %v", err)
+	}
+	rec.Inferred = true
+	rec.Sources = []registry.TelemetrySource{{
+		Kind: "cloudwatch-logs",
+		Ref:  "/aws/lambda/svc--staging-callback", // the stale wrong guess
+		Dims: map[string]string{"match": "prefix"},
+	}}
+	if err := cfg.Registry.Put(context.Background(), rec); err != nil {
+		t.Fatalf("reseed: %v", err)
+	}
+
+	rr := do(t, logsMux(cfg), "GET", "/api/v1/services/svc--staging/logs",
+		jwtFor(t, "operator", ""), nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var refs []string
+	for _, s := range prov.got.Sources {
+		refs = append(refs, s.Ref)
+	}
+	if !slices.Contains(refs, "svc--staging-access-logs") {
+		t.Errorf("provider got %v, want the re-derived access-logs group", refs)
+	}
+	if slices.Contains(refs, "/aws/lambda/svc--staging-callback") {
+		t.Errorf("provider got %v, which still carries the stale stored guess", refs)
 	}
 }
