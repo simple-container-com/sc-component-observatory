@@ -33,7 +33,7 @@ func TestSanitizeClientConfig_StripsSecretsKeepsStructure(t *testing.T) {
 			"secrets": map[string]any{"SOME_SECRET": "${secret:some-alias}"},
 		},
 	}
-	out := SanitizeClientConfig(in)
+	out := SanitizeClientConfig(in, []byte(testFPKey))
 
 	// Serialise and scan: a leak anywhere in the tree is what matters,
 	// not whether one particular path was handled.
@@ -77,7 +77,8 @@ func TestSanitizeClientConfig_StripsSecretsKeepsStructure(t *testing.T) {
 
 	// A redacted key must still BE there — "unset" and "set but hidden"
 	// are different facts for someone debugging a deploy.
-	if cfg["signingKey"] != redacted {
+	marker, ok := cfg["signingKey"].(string)
+	if !ok || !strings.HasPrefix(marker, "[redacted") {
 		t.Errorf("signingKey should be present-but-redacted, got %v", cfg["signingKey"])
 	}
 }
@@ -89,14 +90,14 @@ func TestSanitizeClientConfig_DoesNotMutateInput(t *testing.T) {
 	in := map[string]any{
 		"nested": map[string]any{"password": "secret-value"},
 	}
-	_ = SanitizeClientConfig(in)
+	_ = SanitizeClientConfig(in, []byte(testFPKey))
 	if got := in["nested"].(map[string]any)["password"]; got != "secret-value" {
 		t.Errorf("input was mutated: %v", got)
 	}
 }
 
 func TestSanitizeClientConfig_NilIsNil(t *testing.T) {
-	if SanitizeClientConfig(nil) != nil {
+	if SanitizeClientConfig(nil, []byte(testFPKey)) != nil {
 		t.Error("nil in must give nil out, so an absent descriptor stays absent")
 	}
 }
@@ -323,5 +324,90 @@ func TestFindStringDeep_DepthBound(t *testing.T) {
 	// Nil root must not panic.
 	if got := findStringDeep(nil, "domain"); got != "" {
 		t.Errorf("nil root: got %q", got)
+	}
+}
+
+// testFPKey stands in for the component's signingKey, which keys the
+// redaction fingerprints.
+const testFPKey = "a-fake-signing-key-that-is-at-least-32-bytes-long"
+
+// TestRedact_FingerprintMakesRotationVisible is the whole point of the
+// fingerprint: with the constant marker this component shipped with, a
+// ROTATED credential diffed as UNCHANGED between two deploys — the most
+// consequential config change a service can undergo, rendered as
+// "nothing happened".
+func TestRedact_FingerprintMakesRotationVisible(t *testing.T) {
+	key := []byte(testFPKey)
+
+	before := SanitizeClientConfig(map[string]any{
+		"config": map[string]any{"apiKey": "old-credential-value"},
+	}, key)
+	after := SanitizeClientConfig(map[string]any{
+		"config": map[string]any{"apiKey": "new-credential-value"},
+	}, key)
+
+	b := before["config"].(map[string]any)["apiKey"].(string)
+	a := after["config"].(map[string]any)["apiKey"].(string)
+	if b == a {
+		t.Fatalf("a rotated secret must not produce an identical marker: %q", a)
+	}
+	for _, m := range []string{b, a} {
+		if !strings.HasPrefix(m, "[redacted:") || !strings.HasSuffix(m, "]") {
+			t.Errorf("marker has the wrong shape: %q", m)
+		}
+	}
+
+	// Stable for an unchanged value, or every deploy would report a
+	// secret change and the signal would be worthless.
+	again := SanitizeClientConfig(map[string]any{
+		"config": map[string]any{"apiKey": "old-credential-value"},
+	}, key)
+	if got := again["config"].(map[string]any)["apiKey"].(string); got != b {
+		t.Errorf("same value fingerprinted differently: %q vs %q", got, b)
+	}
+}
+
+// TestRedact_FingerprintIsKeyed — an unkeyed digest of a short or
+// low-entropy secret, published to a dashboard, is offline-guessable.
+// Two different keys must produce different fingerprints for the same
+// value.
+func TestRedact_FingerprintIsKeyed(t *testing.T) {
+	one := redact("hunter2", []byte("key-one-which-is-long-enough-abcdef"))
+	two := redact("hunter2", []byte("key-two-which-is-long-enough-abcdef"))
+	if one == two {
+		t.Errorf("fingerprint is not keyed: %q", one)
+	}
+	if strings.Contains(one, "hunter2") {
+		t.Errorf("marker leaks the value: %q", one)
+	}
+}
+
+// TestRedact_NoKeyDegradesToPlainMarker — safe, but it makes rotations
+// invisible, so it must be a visible fallback rather than a hash of an
+// empty key.
+func TestRedact_NoKeyDegradesToPlainMarker(t *testing.T) {
+	if got := redact("whatever", nil); got != redactedPlain {
+		t.Errorf("expected the plain marker without a key, got %q", got)
+	}
+}
+
+// TestRedact_NonStringSecretBlock — a credential-shaped key can hold a
+// map (a `secrets:` block). Fingerprinting its canonical JSON keeps a
+// changed BLOCK as visible as a changed string, and the value must not
+// survive.
+func TestRedact_NonStringSecretBlock(t *testing.T) {
+	key := []byte(testFPKey)
+	out := SanitizeClientConfig(map[string]any{
+		"credentials": map[string]any{"user": "admin", "pass": "s3cr3t"},
+	}, key)
+	marker, ok := out["credentials"].(string)
+	if !ok || !strings.HasPrefix(marker, "[redacted:") {
+		t.Fatalf("secret block should collapse to a fingerprinted marker, got %#v", out["credentials"])
+	}
+	changed := SanitizeClientConfig(map[string]any{
+		"credentials": map[string]any{"user": "admin", "pass": "rotated"},
+	}, key)
+	if changed["credentials"].(string) == marker {
+		t.Error("a changed secret block produced an identical marker")
 	}
 }

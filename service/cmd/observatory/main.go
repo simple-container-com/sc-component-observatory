@@ -142,6 +142,7 @@ func run() error {
 	// Authenticated surface.
 	mux.Handle("GET /api/v1/services", auth(http.HandlerFunc(services.List)))
 	mux.Handle("GET /api/v1/services/{stack}", auth(http.HandlerFunc(services.Get)))
+	mux.Handle("GET /api/v1/services/{stack}/deploys", auth(http.HandlerFunc(services.Deploys)))
 	mux.Handle("DELETE /api/v1/services/{stack}", auth(http.HandlerFunc(services.Delete)))
 	mux.Handle("POST /api/v1/services/register", auth(http.HandlerFunc(services.Register)))
 

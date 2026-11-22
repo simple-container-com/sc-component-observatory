@@ -169,6 +169,9 @@ func (c *ServicesConfig) List(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "registry not wired")
 		return
 	}
+	if !requireOperator(w, r) {
+		return
+	}
 	recs, err := c.Registry.List(r.Context())
 	if err != nil {
 		slog.Error("services list failed", "err", err)
@@ -205,6 +208,9 @@ func (c *ServicesConfig) Get(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "registry not wired")
 		return
 	}
+	if !requireOperator(w, r) {
+		return
+	}
 	stack := pathParam(r, "stack")
 	if stack == "" {
 		writeErr(w, http.StatusBadRequest, "stack path param required")
@@ -226,8 +232,15 @@ func (c *ServicesConfig) Get(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("deploy history read failed", "stack", stack, "err", err)
 		hist = nil
 	}
-	events := make([]registry.DeployEvent, 0, len(hist))
-	events = append(events, hist...)
+	// Emitted through the wire type, not the record: one timeline shape
+	// for both this endpoint and /deploys, so the SPA has a single
+	// mirror to keep faithful. Diffs are not computed here — they cost
+	// a snapshot GET per row and the detail view asks for them
+	// separately.
+	events := make([]deployJSON, 0, len(hist))
+	for _, ev := range hist {
+		events = append(events, toDeployJSON(ev))
+	}
 
 	svc := toServiceJSON(rec, c.now())
 	latestHealth := map[string]registry.HealthResult{}
@@ -267,6 +280,9 @@ func (c *ServicesConfig) Get(w http.ResponseWriter, r *http.Request) {
 func (c *ServicesConfig) Delete(w http.ResponseWriter, r *http.Request) {
 	if c.Registry == nil {
 		writeErr(w, http.StatusNotImplemented, "registry not wired")
+		return
+	}
+	if !requireOperator(w, r) {
 		return
 	}
 	stack := pathParam(r, "stack")

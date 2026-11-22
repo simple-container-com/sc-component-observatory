@@ -3,7 +3,13 @@
 
 package observatory
 
-import "strings"
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"strings"
+)
 
 // secretKeyHints are substrings that mark a config key as sensitive.
 //
@@ -40,16 +46,66 @@ var secretKeyHints = []string{
 // anything that still carries an unresolved `${secret:...}` reference
 // (harmless in itself, but it reveals the operator's secret ALIASES,
 // which is a needless disclosure for a view that cannot use them).
-func SanitizeClientConfig(in map[string]any) map[string]any {
+//
+// `fpKey` keys the fingerprint appended to each redaction marker — see
+// redact. Pass the component's own signingKey. An empty key degrades to
+// a bare `[redacted]`, which is safe but makes rotations invisible to
+// the diff.
+func SanitizeClientConfig(in map[string]any, fpKey []byte) map[string]any {
 	if in == nil {
 		return nil
 	}
-	return sanitizeMap(in)
+	return sanitizeMap(in, fpKey)
 }
 
-const redacted = "[redacted]"
+const redactedPlain = "[redacted]"
 
-func sanitizeMap(in map[string]any) map[string]any {
+// redact replaces a sensitive value with a marker carrying a short
+// KEYED fingerprint of the value: `[redacted:ab12cd]`.
+//
+// The fingerprint exists for the deploy-config diff. With a constant
+// marker, a ROTATED credential diffs as unchanged — the single most
+// important config change a service can undergo renders as "nothing
+// happened", which is precisely the silent degradation this component
+// is supposed to eliminate. With a fingerprint it renders as "this
+// secret changed", and the diff never shows the value.
+//
+// Keyed with HMAC, not a plain hash: secrets are often short or
+// low-entropy (a password, a 6-digit key id), and an unkeyed digest
+// published to a dashboard would be offline-guessable. The key is the
+// component's signingKey, which lives in the operator's SC registry and
+// never in the bucket the fingerprints land in.
+//
+// Six hex characters: enough that two different values colliding is
+// unlikely (~1 in 16M), short enough to be visibly a fingerprint rather
+// than something to copy around.
+func redact(value string, fpKey []byte) string {
+	if len(fpKey) == 0 {
+		return redactedPlain
+	}
+	mac := hmac.New(sha256.New, fpKey)
+	mac.Write([]byte(value))
+	return "[redacted:" + hex.EncodeToString(mac.Sum(nil))[:6] + "]"
+}
+
+// redactAny fingerprints a non-string secret (a nested map or list
+// under a credential-shaped key) off its canonical JSON, so a changed
+// secret BLOCK is as visible as a changed secret string.
+func redactAny(v any, fpKey []byte) string {
+	if s, ok := v.(string); ok {
+		return redact(s, fpKey)
+	}
+	raw, err := json.Marshal(v)
+	if err != nil {
+		// Unfingerprintable, so say nothing about it rather than
+		// fingerprint a Go-formatted approximation that could differ
+		// between runs and invent a change on every deploy.
+		return redactedPlain
+	}
+	return redact(string(raw), fpKey)
+}
+
+func sanitizeMap(in map[string]any, fpKey []byte) map[string]any {
 	out := make(map[string]any, len(in))
 	for k, v := range in {
 		if isSecretKey(k) {
@@ -57,34 +113,34 @@ func sanitizeMap(in map[string]any) map[string]any {
 			// deploy needs to know a signingKey was configured; they do
 			// not need its value, and omitting the key entirely would
 			// make "unset" and "set but hidden" indistinguishable.
-			out[k] = redacted
+			out[k] = redactAny(v, fpKey)
 			continue
 		}
-		out[k] = sanitizeValue(v)
+		out[k] = sanitizeValue(v, fpKey)
 	}
 	return out
 }
 
-func sanitizeValue(v any) any {
+func sanitizeValue(v any, fpKey []byte) any {
 	switch t := v.(type) {
 	case map[string]any:
-		return sanitizeMap(t)
+		return sanitizeMap(t, fpKey)
 	case []any:
 		out := make([]any, 0, len(t))
 		for _, item := range t {
-			out = append(out, sanitizeValue(item))
+			out = append(out, sanitizeValue(item, fpKey))
 		}
 		return out
 	case string:
 		if strings.Contains(t, "${secret:") {
-			return redacted
+			return redact(t, fpKey)
 		}
 		// A credential embedded in a URI survives key-matching, because
 		// the key that holds it is innocuous: MONGO_URI, DATABASE_URL,
 		// AMQP_ADDR. Caught by a test that scanned the whole serialized
 		// tree rather than the paths this function remembered to handle.
 		if hasURICredential(t) {
-			return redacted
+			return redact(t, fpKey)
 		}
 		return t
 	default:

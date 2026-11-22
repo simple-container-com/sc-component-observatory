@@ -29,6 +29,7 @@ func mux(cfg *ServicesConfig) *http.ServeMux {
 	auth := JWTMiddleware([]byte(testKey))
 	m.Handle("GET /api/v1/services", auth(http.HandlerFunc(cfg.List)))
 	m.Handle("GET /api/v1/services/{stack}", auth(http.HandlerFunc(cfg.Get)))
+	m.Handle("GET /api/v1/services/{stack}/deploys", auth(http.HandlerFunc(cfg.Deploys)))
 	m.Handle("DELETE /api/v1/services/{stack}", auth(http.HandlerFunc(cfg.Delete)))
 	m.Handle("POST /api/v1/services/register", auth(http.HandlerFunc(cfg.Register)))
 	return m

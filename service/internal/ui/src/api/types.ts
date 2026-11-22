@@ -57,15 +57,66 @@ export interface Service {
   has_client_config: boolean;
 }
 
+/** One leaf of the client config that differs between two deploys. */
+export interface ConfigChange {
+  /** Full dotted path into the snapshot — two buckets can share a key. */
+  path: string;
+  /** Display label within its bucket. */
+  key: string;
+  kind: "added" | "removed" | "changed";
+  previous?: string;
+  current?: string;
+  /**
+   * The value was redacted at the source. Both sides render as
+   * `[redacted]`: the plugin's keyed fingerprints already proved they
+   * differ, which is the entire signal.
+   */
+  secret?: boolean;
+}
+
+/**
+ * What changed between a deploy and the one before it.
+ *
+ * `unavailable` is load-bearing and must be rendered whenever set: an
+ * absent snapshot is NOT "nothing changed", and conflating the two is
+ * the silent degradation this component exists to avoid. All four
+ * buckets are always arrays — the Go side guarantees it.
+ */
+export interface ConfigDiff {
+  env: ConfigChange[];
+  compute: ConfigChange[];
+  settings: ConfigChange[];
+  artifact: ConfigChange[];
+  unavailable?: string;
+  truncated?: boolean;
+}
+
 export interface DeployEvent {
   id: string;
   stack: string;
   version: string;
   commit?: string;
+  short_commit?: string;
   template: string;
   cloud: string;
+  repository?: string;
   deployed_at: string;
   previous_version?: string;
+  /**
+   * A config snapshot was stored for this deploy. False for every
+   * deploy that predates snapshot capture, and for one whose plugin
+   * sent no client config — in both cases a diff is impossible and
+   * `diff.unavailable` says which.
+   */
+  config_captured?: boolean;
+  /** Only present on `GET /services/{stack}/deploys`. */
+  diff?: ConfigDiff;
+}
+
+export interface DeploysResponse {
+  stack: string;
+  count: number;
+  deploys: DeployEvent[];
 }
 
 export interface HealthResult {

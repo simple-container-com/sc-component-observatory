@@ -120,6 +120,26 @@ func ClaimsFromContext(ctx context.Context) *Claims {
 	return nil
 }
 
+// requireOperator gates the dashboard's read routes on a human session.
+//
+// Validity alone is not enough, and this is not theoretical: EVERY
+// consumer stack's plugin holds a valid `register` token for this
+// service, so a read route that accepted any valid token would let any
+// one tenant read every other tenant's record — including the full
+// sanitized client config the detail view serves and the per-deploy
+// diffs built from it. Registration tokens are scoped to one `tenant`
+// precisely so a consumer cannot reach beyond itself; letting the same
+// token read the whole fleet would hand back what that scoping took
+// away.
+func requireOperator(w http.ResponseWriter, r *http.Request) bool {
+	claims := ClaimsFromContext(r.Context())
+	if claims == nil || claims.Op != OpOperator {
+		writeErr(w, http.StatusForbidden, "token op must be 'operator'")
+		return false
+	}
+	return true
+}
+
 // Token purposes. Constants rather than literals because they are
 // compared in two repos — the service checks them, the plugin mints
 // them — and a typo on either side fails as a 401 with nothing naming

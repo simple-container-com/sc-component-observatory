@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -40,6 +41,23 @@ type Store interface {
 	// DeployHistory returns events for one stack, newest first.
 	// limit <= 0 means no cap.
 	DeployHistory(ctx context.Context, stack string, limit int) ([]DeployEvent, error)
+
+	// PutDeployConfig stores one deploy's sanitized client-config
+	// snapshot, keyed by its event id.
+	//
+	// A separate object rather than a field on DeployEvent, on purpose.
+	// The timeline is read on every detail view and the colocated store
+	// must decode every event object in the page to order them, so
+	// folding a compose block into each event would make the cheap read
+	// pay for the expensive one. Only the diff path fetches snapshots,
+	// and only for the page it renders.
+	PutDeployConfig(ctx context.Context, stack, eventID string, cfg map[string]any) error
+
+	// DeployConfig returns one stored snapshot. found=false with no
+	// error when that deploy recorded none — which must stay
+	// distinguishable from an empty config, because the first renders as
+	// "no snapshot" and the second as "no changes".
+	DeployConfig(ctx context.Context, stack, eventID string) (map[string]any, bool, error)
 
 	// PutHealth records one probe outcome.
 	PutHealth(ctx context.Context, res HealthResult) error
@@ -240,9 +258,35 @@ func Register(ctx context.Context, store Store, incoming ServiceRecord, now time
 			Commit:          rec.Commit,
 			Template:        rec.Template,
 			Cloud:           rec.Cloud,
+			Repository:      rec.Repository,
 			DeployedAt:      rec.DeployedAt,
 			PreviousVersion: previousVersion,
 		}
+
+		// The config snapshot is what makes "what changed since the
+		// previous deploy" answerable at all, and it is only answerable
+		// GOING FORWARD: a deploy that happened before this field
+		// existed left nothing to compare against, and no amount of
+		// later cleverness recovers it.
+		//
+		// Keyed on what THIS registration carried (incoming), not the
+		// merged record: the merge preserves a previous config when a
+		// deploy sends none, and snapshotting that would compare a
+		// deploy against itself and render a confident "no changes".
+		if len(incoming.ClientConfig) > 0 {
+			if cerr := store.PutDeployConfig(ctx, rec.Stack, ev.ID, incoming.ClientConfig); cerr != nil {
+				// Non-fatal, and the flag stays false. A registration is
+				// a more important fact than its snapshot, but claiming
+				// a snapshot that is not there would make the diff
+				// endpoint report "no changes" for a config it could
+				// never read.
+				slog.Warn("deploy config snapshot not stored",
+					"stack", rec.Stack, "event", ev.ID, "err", cerr)
+			} else {
+				ev.ConfigCaptured = true
+			}
+		}
+
 		if err := store.AppendDeployEvent(ctx, ev); err != nil {
 			return ServiceRecord{}, err
 		}

@@ -58,11 +58,17 @@ func NewColocatedStore(objects storage.Store, prefix string) *ColocatedStore {
 }
 
 const (
-	metaRoot     = "_meta"
-	servicesDir  = "services"
-	deploysDir   = "deploys"
-	jsonFileExt  = ".json"
-	maxEventScan = 500
+	metaRoot    = "_meta"
+	servicesDir = "services"
+	deploysDir  = "deploys"
+	// deployConfigsDir keeps config snapshots in their OWN prefix rather
+	// than beside the events. Sharing the prefix would make
+	// DeployHistory's LIST return both and force it to filter by name —
+	// a filter that is one forgotten suffix away from decoding a
+	// snapshot as an event and dropping a deploy from the timeline.
+	deployConfigsDir = "deploy-configs"
+	jsonFileExt      = ".json"
+	maxEventScan     = 500
 )
 
 // encodeStack makes a stack name safe for one path segment. Only
@@ -186,7 +192,7 @@ func (s *ColocatedStore) Put(ctx context.Context, rec ServiceRecord) error {
 // event delete must not leave the record itself behind and make them
 // run it again.
 func (s *ColocatedStore) Delete(ctx context.Context, stack string) error {
-	for _, prefix := range []string{s.deployPrefix(stack), s.healthPrefix(stack)} {
+	for _, prefix := range []string{s.deployPrefix(stack), s.deployConfigPrefix(stack), s.healthPrefix(stack)} {
 		objs, err := s.objects.List(ctx, prefix)
 		if err != nil {
 			continue
@@ -249,6 +255,29 @@ func (s *ColocatedStore) DeployHistory(ctx context.Context, stack string, limit 
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+func (s *ColocatedStore) deployConfigPrefix(stack string) string {
+	return s.key(deployConfigsDir, encodeStack(stack)) + "/"
+}
+
+func (s *ColocatedStore) PutDeployConfig(ctx context.Context, stack, eventID string, cfg map[string]any) error {
+	if eventID == "" {
+		return errors.New("deploy config has no event ID")
+	}
+	return s.putJSON(ctx, s.deployConfigPrefix(stack)+eventID+jsonFileExt, cfg)
+}
+
+func (s *ColocatedStore) DeployConfig(ctx context.Context, stack, eventID string) (map[string]any, bool, error) {
+	if eventID == "" {
+		return nil, false, nil
+	}
+	var cfg map[string]any
+	found, err := s.getJSON(ctx, s.deployConfigPrefix(stack)+eventID+jsonFileExt, &cfg)
+	if err != nil {
+		return nil, false, err
+	}
+	return cfg, found, nil
 }
 
 func (s *ColocatedStore) Close(_ context.Context) error { return nil }

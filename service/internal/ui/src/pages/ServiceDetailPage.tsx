@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import { ArrowLeft, ExternalLink } from "lucide-react";
 import { api, describeError } from "@/api/client";
+import type { ConfigChange, ConfigDiff, DeployEvent } from "@/api/types";
 import { ErrorBox, HealthBadge, Pill, Spinner, exact, relTime } from "@/components/bits";
 
 export function ServiceDetailPage() {
@@ -107,26 +108,7 @@ export function ServiceDetailPage() {
         </div>
       )}
 
-      {/* Deploy timeline. */}
-      <div className="card p-4">
-        <h2 className="text-sm font-medium">Deploy history</h2>
-        {d.deploys.length === 0 ? (
-          <p className="mt-2 text-sm text-muted">No deploys recorded yet.</p>
-        ) : (
-          <ul className="mt-3 divide-y divide-line/60">
-            {d.deploys.map((ev) => (
-              <li key={ev.id} className="flex flex-wrap items-center gap-3 py-2 text-sm">
-                <span className="font-mono text-xs">{ev.version}</span>
-                {ev.previous_version && <span className="text-xs text-faint">from {ev.previous_version}</span>}
-                {ev.commit && <span className="font-mono text-xs text-faint">{ev.commit.slice(0, 7)}</span>}
-                <span className="ml-auto text-xs text-muted tnum" title={exact(ev.deployed_at)}>
-                  {relTime(ev.deployed_at)}
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
+      <DeployTimeline stack={s.stack} fallback={d.deploys} />
 
       {/* Logs + metrics are the next slices. Stubbed EXPLICITLY rather
           than shown as empty panels: an empty chart reads as "no
@@ -158,6 +140,169 @@ export function ServiceDetailPage() {
       )}
     </div>
   );
+}
+
+/**
+ * Deploy timeline with, per row, what changed since the deploy before
+ * it.
+ *
+ * Its own query: the diff costs the backend one snapshot read per row,
+ * so the detail payload carries the timeline WITHOUT diffs and this
+ * fetches the annotated version alongside it. `fallback` is that
+ * diff-less list — if the diff query fails, the timeline still renders
+ * and the failure is reported in place of the diffs, rather than the
+ * whole card disappearing over an additive feature.
+ */
+function DeployTimeline({ stack, fallback }: { stack: string; fallback: DeployEvent[] }) {
+  const q = useQuery({
+    queryKey: ["deploys", stack],
+    queryFn: () => api.deploys(stack),
+    refetchInterval: 60_000,
+  });
+  const rows = q.data?.deploys ?? fallback;
+
+  return (
+    <div className="card p-4">
+      <div className="flex items-center gap-2">
+        <h2 className="text-sm font-medium">Deploy history</h2>
+        {q.isFetching && !q.data && <span className="text-xs text-faint">loading diffs…</span>}
+      </div>
+
+      {q.error && (
+        <p className="mt-2 text-xs text-warn">
+          Diffs unavailable: {describeError(q.error)}
+        </p>
+      )}
+
+      {rows.length === 0 ? (
+        <p className="mt-2 text-sm text-muted">No deploys recorded yet.</p>
+      ) : (
+        <ul className="mt-3 divide-y divide-line/60">
+          {rows.map((ev) => (
+            <DeployRow key={ev.id} ev={ev} />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function DeployRow({ ev }: { ev: DeployEvent }) {
+  const diff = ev.diff;
+  const n = diff ? countChanges(diff) : 0;
+
+  const header = (
+    <div className="flex flex-wrap items-center gap-3 py-2 text-sm">
+      <span className="font-mono text-xs">{ev.version}</span>
+      {ev.previous_version && <span className="text-xs text-faint">from {ev.previous_version}</span>}
+      {ev.commit && <span className="font-mono text-xs text-faint">{ev.commit.slice(0, 7)}</span>}
+      <DiffSummary diff={diff} count={n} />
+      <span className="ml-auto text-xs text-muted tnum" title={exact(ev.deployed_at)}>
+        {relTime(ev.deployed_at)}
+      </span>
+    </div>
+  );
+
+  // Nothing to expand when there is no diff object at all (the
+  // diff-less fallback list). An empty <details> that opens onto
+  // nothing is worse than a plain row.
+  if (!diff) return <li>{header}</li>;
+
+  return (
+    <li>
+      <details className="group">
+        <summary className="cursor-pointer list-none">{header}</summary>
+        <div className="pb-3 pl-1">
+          {diff.unavailable ? (
+            /* Never an empty diff: "we have no snapshot" and "nothing
+               changed" are different answers and an operator acts
+               differently on each. */
+            <p className="text-xs text-faint">{diff.unavailable}</p>
+          ) : n === 0 ? (
+            <p className="text-xs text-muted">
+              No change in the client config — same settings, new build.
+            </p>
+          ) : (
+            <div className="space-y-3">
+              <ChangeGroup label="Environment" changes={diff.env} />
+              <ChangeGroup label="Compute" changes={diff.compute} />
+              <ChangeGroup label="Settings" changes={diff.settings} />
+              <ChangeGroup label="Artifact" changes={diff.artifact} />
+              {diff.truncated && (
+                <p className="text-xs text-warn">
+                  This diff was truncated — some changes are not shown.
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+      </details>
+    </li>
+  );
+}
+
+function DiffSummary({ diff, count }: { diff?: ConfigDiff; count: number }) {
+  if (!diff) return null;
+  if (diff.unavailable) {
+    return (
+      <Pill title={diff.unavailable}>no diff</Pill>
+    );
+  }
+  if (count === 0) return <span className="text-xs text-faint">no config change</span>;
+
+  const parts: string[] = [];
+  if (diff.env.length) parts.push(`${diff.env.length} env`);
+  if (diff.compute.length) parts.push(`${diff.compute.length} compute`);
+  if (diff.settings.length) parts.push(`${diff.settings.length} settings`);
+  if (diff.artifact.length) parts.push(`${diff.artifact.length} artifact`);
+  return <Pill tone="accent">{parts.join(" · ")}</Pill>;
+}
+
+function ChangeGroup({ label, changes }: { label: string; changes: ConfigChange[] }) {
+  if (changes.length === 0) return null;
+  return (
+    <div>
+      <h3 className="text-xs font-medium text-faint">{label}</h3>
+      <ul className="mt-1 space-y-1">
+        {changes.map((c) => (
+          <li key={c.path} className="font-mono text-[11px] leading-relaxed">
+            <span className={kindColor(c.kind)} title={c.kind}>
+              {kindMark(c.kind)}
+            </span>{" "}
+            <span className="text-fg" title={c.path}>
+              {c.key}
+            </span>
+            {c.secret && (
+              <span className="ml-1.5 font-sans text-[10px] text-warn" title="Redacted at the source; its fingerprint changed, so the value was rotated">
+                secret
+              </span>
+            )}
+            <span className="text-muted">
+              {c.kind === "added" ? (
+                <> → {c.current}</>
+              ) : c.kind === "removed" ? (
+                <> {c.previous} →</>
+              ) : (
+                <> {c.previous} → {c.current}</>
+              )}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function countChanges(d: ConfigDiff): number {
+  return d.env.length + d.compute.length + d.settings.length + d.artifact.length;
+}
+
+function kindMark(kind: string): string {
+  return kind === "added" ? "+" : kind === "removed" ? "−" : "~";
+}
+
+function kindColor(kind: string): string {
+  return kind === "added" ? "text-ok" : kind === "removed" ? "text-danger" : "text-accent";
 }
 
 function Fact({ label, value, mono, title }: { label: string; value: string; mono?: boolean; title?: string }) {
