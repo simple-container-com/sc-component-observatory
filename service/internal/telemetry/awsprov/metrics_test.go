@@ -271,6 +271,74 @@ func TestMetricsAbsentIsNotEmpty(t *testing.T) {
 	}
 }
 
+// TestMetricsTruncatedListingDoesNotClaimAbsence — the absence message
+// is an assertion of fact ("this workload has never emitted it"), and a
+// listing that ran out of pages cannot support one.
+//
+// Live-caught 2026-11-22 on monitor.simple-forge.com: five of the six
+// Lambda tenants were each told a DIFFERENT arbitrary subset of their
+// metrics had never been emitted, while the tenant listed earliest in
+// the namespace had all five. A prefix handle lists the whole namespace
+// (ListMetrics has no prefix operator) and the page budget cut it off
+// mid-inventory, so what a tenant was told depended on where it happened
+// to fall in the listing.
+func TestMetricsTruncatedListingDoesNotClaimAbsence(t *testing.T) {
+	listed := []cwmtypes.Metric{
+		// The tenant's Invocations is reachable within the budget.
+		lambdaMetric("svc-callback-1", "Invocations"),
+	}
+	// Enough other functions to exhaust the page budget. They match the
+	// name-only FunctionName filter (so they cost pages) but fail the
+	// client-side prefix check (so they are not charted) — exactly the
+	// shape of an account full of abandoned isolated-stack functions.
+	for i := 0; i < listMetricsPages+2; i++ {
+		listed = append(listed, lambdaMetric("other-fn-"+strings.Repeat("a", i+1), "Invocations"))
+	}
+	// ...and the tenant's Errors sits past the cut-off. It EXISTS.
+	listed = append(listed, lambdaMetric("svc-callback-1", "Errors"))
+
+	f := &fakeCWM{
+		listed:       map[string][]cwmtypes.Metric{"AWS/Lambda": listed},
+		listPageSize: 1,
+		values:       map[string][]float64{"Invocations|svc-callback-1": {1}},
+	}
+	p := newMetricProvider(t, f)
+
+	res, err := p.Metrics(context.Background(), telemetry.MetricQuery{
+		Sources: []registry.TelemetrySource{lambdaSource("svc")},
+		Start:   base, End: base.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("Metrics: %v", err)
+	}
+	if f.listCalls != listMetricsPages {
+		t.Fatalf("ListMetrics called %d times, want the %d-page budget to be spent", f.listCalls, listMetricsPages)
+	}
+
+	errs, ok := seriesByName(res, "Errors")
+	if !ok {
+		t.Fatal("Errors is missing from the response entirely")
+	}
+	if errs.Absent {
+		t.Error("Errors was reported Absent from a TRUNCATED listing — the metric exists on a page that was never read")
+	}
+	if strings.Contains(errs.Reason, "never emitted") {
+		t.Errorf("Errors reason = %q — a partial listing must not assert the metric was never emitted", errs.Reason)
+	}
+
+	// And the truncation itself is said out loud, since the rendered page
+	// otherwise looks no different from a complete one.
+	var said bool
+	for _, w := range res.Warnings {
+		if strings.Contains(w, "page limit") || strings.Contains(w, "partly known") {
+			said = true
+		}
+	}
+	if !said {
+		t.Errorf("warnings = %v, want one naming the truncated discovery", res.Warnings)
+	}
+}
+
 // TestMetricsOneSeriesPerFunction — AWS/Lambda publishes the same
 // metric names under {FunctionName}, {FunctionName,Resource} and
 // {FunctionName,ExecutedVersion}. Accepting all three charts one
