@@ -4,6 +4,7 @@
 package observatory
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -160,7 +161,7 @@ func TestHealthPathFromClientConfig(t *testing.T) {
 		{name: "nothing declared", cfg: map[string]any{"template": "lambda"}, want: ""},
 		{name: "nil config", cfg: nil, want: ""},
 	} {
-		if got := HealthPathFromClientConfig(tc.cfg); got != tc.want {
+		if got := HealthPathFromClientConfig(context.Background(), tc.cfg); got != tc.want {
 			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
 		}
 	}

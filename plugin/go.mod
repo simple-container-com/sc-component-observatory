@@ -8,6 +8,7 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/pkg/errors v0.9.1
 	github.com/pulumi/pulumi/sdk/v3 v3.245.0
+	github.com/compose-spec/compose-go v1.20.2
 	github.com/simple-container-com/api v0.0.0-20261119091249-49facf7520b2
 )
 
@@ -217,7 +218,6 @@ require (
 	github.com/clipperhouse/displaywidth v0.11.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/cloudflare/circl v1.6.3 // indirect
-	github.com/compose-spec/compose-go v1.20.2 // indirect
 	github.com/cyphar/filepath-securejoin v0.6.1 // indirect
 	github.com/distribution/reference v0.6.0 // indirect
 	github.com/djherbis/times v1.5.0 // indirect

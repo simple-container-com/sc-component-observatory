@@ -132,7 +132,7 @@ func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInp
 	// one secret both sides of this component already share, and it
 	// never leaves the operator's SC registry for the bucket the
 	// fingerprints land in. See redact.
-	rec := p.buildRecord(stackName, input, collector, p.cfg.ClientConfig, []byte(signingKey))
+	rec := p.buildRecord(ctx.Context(), stackName, input, collector, p.cfg.ClientConfig, []byte(signingKey))
 
 	token, err := mintJWT(signingKey, stackName, jwtLifetime)
 	if err != nil {
@@ -176,7 +176,7 @@ func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInp
 // is NOT auto-injected (the deploy action exports GITHUB_SHA and
 // services opt into passing it as a build arg), so it is best-effort
 // and the service falls back to the short SHA inside the CalVer string.
-func (p *Processor) buildRecord(stackName string, input api.ResourceInput, collector pApi.ComputeContextCollector, clientCfg map[string]any, fpKey []byte) ServiceRecord {
+func (p *Processor) buildRecord(ctx context.Context, stackName string, input api.ResourceInput, collector pApi.ComputeContextCollector, clientCfg map[string]any, fpKey []byte) ServiceRecord {
 	template := p.deriveTemplate(clientCfg)
 	region := p.deriveRegion(input)
 
@@ -215,8 +215,10 @@ func (p *Processor) buildRecord(stackName string, input api.ResourceInput, colle
 		// break health probing.
 		rec.EndpointURL = EndpointURLFromClientConfig(clientCfg)
 		// The consumer knows where its own probe lives better than a
-		// fleet-wide default does.
-		rec.HealthPath = HealthPathFromClientConfig(clientCfg)
+		// fleet-wide default does. For a `cloud-compose` consumer this
+		// reads the compose file's ingress-container label, which is the
+		// only place such a stack states it — see ComposeHealthPath.
+		rec.HealthPath = HealthPathFromClientConfig(ctx, clientCfg)
 		// A template that only names one region still deploys to one;
 		// recording it lets the dashboard label the probe.
 		if region := p.deriveRegion(input); region != "" {

@@ -4,6 +4,7 @@
 package observatory
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -194,12 +195,16 @@ func isSecretKey(key string) bool {
 //  1. `healthPath` / `healthcheck.path` — an explicit statement.
 //  2. A compose service's `healthcheck.test`, when it is an HTTP probe
 //     (`curl`/`wget` against a URL) — parsed for the path only.
+//  3. The ingress container's `simple-container.com/healthcheck/path`
+//     label in the consumer's docker-compose file, which is where a
+//     `cloud-compose` stack actually declares this and the only one of
+//     the three that needs a file read. See ComposeHealthPath.
 //
 // Returns "" when nothing is declared, and the caller falls back to
 // the component-wide default. Deliberately does NOT guess from a port
 // or a route list: a wrong health path reports a healthy service as
 // down, which is worse than probing a sensible default.
-func HealthPathFromClientConfig(cfg map[string]any) string {
+func HealthPathFromClientConfig(ctx context.Context, cfg map[string]any) string {
 	if cfg == nil {
 		return ""
 	}
@@ -219,7 +224,11 @@ func HealthPathFromClientConfig(cfg map[string]any) string {
 			return p
 		}
 	}
-	return ""
+	// Last, because it is the only branch that touches the filesystem —
+	// and it is the branch that answers for every `cloud-compose` stack,
+	// since such a stack's descriptor carries a compose FILE PATH and no
+	// healthcheck block at all.
+	return ComposeHealthPath(ctx, cfg)
 }
 
 // pathFromComposeTest extracts a URL path from a compose healthcheck
