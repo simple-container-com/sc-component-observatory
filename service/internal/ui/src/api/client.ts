@@ -1,4 +1,4 @@
-import type { ServiceDetail, ServicesResponse, SessionInfo } from "./types";
+import type { DeploysResponse, ServiceDetail, ServicesResponse, SessionInfo } from "./types";
 
 /**
  * Every error path on the Go side returns parseable JSON with an
@@ -45,6 +45,17 @@ export const api = {
   services: () => request<ServicesResponse>("GET", "/api/v1/services"),
   service: (stack: string) =>
     request<ServiceDetail>("GET", `/api/v1/services/${encodeURIComponent(stack)}`),
+  /**
+   * The deploy timeline WITH a per-deploy config diff. Separate from
+   * `service()` because each row costs the backend a snapshot read, so
+   * the detail payload carries the timeline without diffs and this is
+   * fetched alongside it.
+   */
+  deploys: (stack: string, limit?: number) =>
+    request<DeploysResponse>(
+      "GET",
+      `/api/v1/services/${encodeURIComponent(stack)}/deploys${limit ? `?limit=${limit}` : ""}`,
+    ),
   removeService: (stack: string) =>
     request<{ deleted: string }>("DELETE", `/api/v1/services/${encodeURIComponent(stack)}`),
 };

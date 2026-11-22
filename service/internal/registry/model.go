@@ -234,8 +234,26 @@ type DeployEvent struct {
 	Cloud      string    `bson:"cloud" json:"cloud"`
 	DeployedAt time.Time `bson:"deployedAt" json:"deployed_at"`
 
+	// Repository is `<owner>/<repo>` at the time of this deploy, so a
+	// timeline row can link to the source it came from even after the
+	// service's current record moved on. Empty against an older SC core
+	// (api#640).
+	Repository string `bson:"repository,omitempty" json:"repository,omitempty"`
+
 	// PreviousVersion is what this deploy replaced, empty on the first
 	// registration. Lets the timeline show version transitions without
 	// the reader diffing adjacent rows.
 	PreviousVersion string `bson:"previousVersion,omitempty" json:"previous_version,omitempty"`
+
+	// ConfigCaptured says a sanitized client-config snapshot was stored
+	// for this deploy and can be fetched with Store.DeployConfig.
+	//
+	// It records what THIS registration carried, not what the merged
+	// record holds. The merge rules preserve a previous config when a
+	// deploy sends none (so the dashboard keeps showing something), and
+	// using that for a diff would silently compare a deploy against
+	// itself and report "no changes" — a wrong answer dressed as a
+	// confident one. False means the diff renders as unavailable with
+	// the reason, which is the honest outcome.
+	ConfigCaptured bool `bson:"configCaptured,omitempty" json:"config_captured,omitempty"`
 }

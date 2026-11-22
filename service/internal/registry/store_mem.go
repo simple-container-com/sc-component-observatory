@@ -5,6 +5,7 @@ package registry
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"sync"
 	"time"
@@ -16,6 +17,10 @@ type InMemoryStore struct {
 	records map[string]ServiceRecord
 	events  map[string][]DeployEvent  // keyed by stack
 	health  map[string][]HealthResult // keyed by stack
+	// configs are deploy config snapshots, keyed by stack then event id
+	// — mirroring the colocated store's separate prefix so the two
+	// implementations cannot disagree about whether a snapshot exists.
+	configs map[string]map[string]map[string]any
 }
 
 func NewInMemoryStore() *InMemoryStore {
@@ -23,6 +28,7 @@ func NewInMemoryStore() *InMemoryStore {
 		records: map[string]ServiceRecord{},
 		events:  map[string][]DeployEvent{},
 		health:  map[string][]HealthResult{},
+		configs: map[string]map[string]map[string]any{},
 	}
 }
 
@@ -57,7 +63,36 @@ func (s *InMemoryStore) Delete(_ context.Context, stack string) error {
 	delete(s.records, stack)
 	delete(s.events, stack)
 	delete(s.health, stack)
+	delete(s.configs, stack)
 	return nil
+}
+
+// PutDeployConfig keeps the snapshot by reference — this store backs
+// tests and local runs, where the caller does not mutate the config
+// after registering it. It rejects an empty event id for the same
+// reason the colocated store does: an unkeyed snapshot is unreachable,
+// and the two implementations must agree on what they refuse.
+func (s *InMemoryStore) PutDeployConfig(_ context.Context, stack, eventID string, cfg map[string]any) error {
+	if eventID == "" {
+		return errors.New("deploy config has no event ID")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.configs == nil {
+		s.configs = map[string]map[string]map[string]any{}
+	}
+	if s.configs[stack] == nil {
+		s.configs[stack] = map[string]map[string]any{}
+	}
+	s.configs[stack][eventID] = cfg
+	return nil
+}
+
+func (s *InMemoryStore) DeployConfig(_ context.Context, stack, eventID string) (map[string]any, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	cfg, ok := s.configs[stack][eventID]
+	return cfg, ok, nil
 }
 
 func (s *InMemoryStore) AppendDeployEvent(_ context.Context, ev DeployEvent) error {

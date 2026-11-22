@@ -5,6 +5,7 @@ package registry
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -254,5 +255,89 @@ func TestColocated_RegisterMergeRulesHold(t *testing.T) {
 	}
 	if !got.FirstSeenAt.Equal(t0) {
 		t.Errorf("FirstSeenAt reset: %v", got.FirstSeenAt)
+	}
+}
+
+// TestColocated_DeployConfigRoundTripAndPrefixIsolation — the snapshot
+// path against the REAL key layout.
+//
+// The prefix isolation is the load-bearing part: DeployHistory LISTs
+// the deploys prefix and decodes EVERY object it finds (up to
+// maxEventScan) to order the timeline. A snapshot stored under that
+// same prefix would be decoded on every timeline read — a compose block
+// per row, for a read that only needs ids and timestamps — and would
+// also masquerade as an event with empty fields.
+func TestColocated_DeployConfigRoundTripAndPrefixIsolation(t *testing.T) {
+	ctx := context.Background()
+	store, objs := colocated(t)
+
+	rec := awsRecord("svc--staging", "v1")
+	rec.ClientConfig = map[string]any{
+		"Config": map[string]any{"config": map[string]any{"maxMemory": 512}},
+	}
+	if _, err := Register(ctx, store, rec, t0); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	hist, err := store.DeployHistory(ctx, "svc--staging", 0)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(hist) != 1 {
+		t.Fatalf("want 1 event, got %d — a snapshot may be masquerading as one: %+v", len(hist), hist)
+	}
+	if !hist[0].ConfigCaptured {
+		t.Fatal("ConfigCaptured not set through the colocated store")
+	}
+
+	cfg, found, err := store.DeployConfig(ctx, "svc--staging", hist[0].ID)
+	if err != nil || !found {
+		t.Fatalf("snapshot: found=%v err=%v", found, err)
+	}
+	outer, _ := cfg["Config"].(map[string]any)
+	inner, _ := outer["config"].(map[string]any)
+	if fmt.Sprint(inner["maxMemory"]) != "512" {
+		t.Errorf("snapshot did not survive the round-trip: %+v", cfg)
+	}
+
+	// Exactly one object under each prefix, and they are different
+	// prefixes.
+	for prefix, want := range map[string]int{
+		"obs/_meta/deploys/":        1,
+		"obs/_meta/deploy-configs/": 1,
+	} {
+		got, _ := objs.List(ctx, prefix)
+		if len(got) != want {
+			t.Errorf("%s holds %d objects, want %d: %+v", prefix, len(got), want, got)
+		}
+	}
+}
+
+// TestColocated_DeleteSweepsConfigSnapshots — a prefix added to the
+// store but forgotten in Delete leaves objects behind forever: the
+// bucket keeps paying for them and a re-registered stack inherits the
+// previous incarnation's diffs.
+func TestColocated_DeleteSweepsConfigSnapshots(t *testing.T) {
+	ctx := context.Background()
+	store, objs := colocated(t)
+
+	rec := awsRecord("gone--staging", "v1")
+	rec.ClientConfig = map[string]any{"template": "lambda"}
+	if _, err := Register(ctx, store, rec, t0); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if left, _ := objs.List(ctx, "obs/_meta/deploy-configs/"); len(left) != 1 {
+		t.Fatalf("precondition: %d snapshots", len(left))
+	}
+
+	if err := store.Delete(ctx, "gone--staging"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	for _, p := range []string{
+		"obs/_meta/services/", "obs/_meta/deploys/", "obs/_meta/deploy-configs/",
+	} {
+		if left, _ := objs.List(ctx, p); len(left) != 0 {
+			t.Errorf("objects left under %s: %+v", p, left)
+		}
 	}
 }

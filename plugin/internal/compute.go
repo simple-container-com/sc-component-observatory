@@ -128,7 +128,11 @@ func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInp
 		return nil, errors.Wrapf(err, "component %q unable to resolve signingKey", resName)
 	}
 
-	rec := p.buildRecord(stackName, input, collector, p.cfg.ClientConfig)
+	// The signingKey doubles as the redaction-fingerprint key: it is the
+	// one secret both sides of this component already share, and it
+	// never leaves the operator's SC registry for the bucket the
+	// fingerprints land in. See redact.
+	rec := p.buildRecord(stackName, input, collector, p.cfg.ClientConfig, []byte(signingKey))
 
 	token, err := mintJWT(signingKey, stackName, jwtLifetime)
 	if err != nil {
@@ -172,7 +176,7 @@ func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInp
 // is NOT auto-injected (the deploy action exports GITHUB_SHA and
 // services opt into passing it as a build arg), so it is best-effort
 // and the service falls back to the short SHA inside the CalVer string.
-func (p *Processor) buildRecord(stackName string, input api.ResourceInput, collector pApi.ComputeContextCollector, clientCfg map[string]any) ServiceRecord {
+func (p *Processor) buildRecord(stackName string, input api.ResourceInput, collector pApi.ComputeContextCollector, clientCfg map[string]any, fpKey []byte) ServiceRecord {
 	template := p.deriveTemplate(input)
 	region := p.deriveRegion(input)
 
@@ -199,7 +203,7 @@ func (p *Processor) buildRecord(stackName string, input api.ResourceInput, colle
 	// simply has no config to show and the service's own health path
 	// falls back to the component default.
 	if len(clientCfg) > 0 {
-		rec.ClientConfig = SanitizeClientConfig(clientCfg)
+		rec.ClientConfig = SanitizeClientConfig(clientCfg, fpKey)
 		// The consumer's own public address. Without it the prober has
 		// nothing to probe and the tenant sits at `unknown` forever,
 		// which is how the first real tenant registered.

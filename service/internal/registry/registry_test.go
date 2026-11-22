@@ -5,6 +5,8 @@ package registry
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -296,6 +298,179 @@ func TestRegister_PreservesClientConfigAndRegions(t *testing.T) {
 	}
 	if got.Version != "v2" {
 		t.Errorf("version should still advance: %q", got.Version)
+	}
+}
+
+// TestRegister_CapturesConfigSnapshotPerDeploy — the point of slice
+// 2.0: every deploy event gets its own frozen copy of the config it
+// deployed, so "what changed since the previous deploy" can be
+// answered later, by a differ that may not be written yet.
+func TestRegister_CapturesConfigSnapshotPerDeploy(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryStore()
+
+	v1 := awsRecord("svc--staging", "v1")
+	v1.ClientConfig = map[string]any{"Config": map[string]any{"config": map[string]any{"maxMemory": 512}}}
+	if _, err := Register(ctx, store, v1, t0); err != nil {
+		t.Fatalf("v1: %v", err)
+	}
+	v2 := awsRecord("svc--staging", "v2")
+	v2.ClientConfig = map[string]any{"Config": map[string]any{"config": map[string]any{"maxMemory": 1024}}}
+	if _, err := Register(ctx, store, v2, t0.Add(time.Hour)); err != nil {
+		t.Fatalf("v2: %v", err)
+	}
+
+	hist, _ := store.DeployHistory(ctx, "svc--staging", 0)
+	if len(hist) != 2 {
+		t.Fatalf("want 2 events, got %d", len(hist))
+	}
+	for _, ev := range hist {
+		if !ev.ConfigCaptured {
+			t.Errorf("event %s (%s) did not record a snapshot", ev.ID, ev.Version)
+		}
+		cfg, found, err := store.DeployConfig(ctx, "svc--staging", ev.ID)
+		if err != nil || !found {
+			t.Fatalf("snapshot %s: found=%v err=%v", ev.ID, found, err)
+		}
+		if len(cfg) == 0 {
+			t.Errorf("snapshot %s is empty", ev.ID)
+		}
+	}
+
+	// The two snapshots are distinct — a shared pointer or a
+	// last-write-wins key would make every diff come out empty.
+	newer, _, _ := store.DeployConfig(ctx, "svc--staging", hist[0].ID)
+	older, _, _ := store.DeployConfig(ctx, "svc--staging", hist[1].ID)
+	get := func(m map[string]any) any {
+		outer, _ := m["Config"].(map[string]any)
+		inner, _ := outer["config"].(map[string]any)
+		return inner["maxMemory"]
+	}
+	if fmt.Sprint(get(newer)) == fmt.Sprint(get(older)) {
+		t.Errorf("both snapshots hold the same config: %v", get(newer))
+	}
+}
+
+// TestRegister_ConfigCapturedReflectsTheRegistration, not the merged
+// record. ClientConfig is preserved-on-empty (see
+// TestRegister_PreservesClientConfigAndRegions), so a deploy that sent
+// no config still ends up with one on the merged record. Marking that
+// event ConfigCaptured would make the diff compare the deploy against
+// its own predecessor's snapshot and report a confident "no changes" —
+// the silent-wrong answer this flag exists to prevent.
+func TestRegister_ConfigCapturedReflectsTheRegistration(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryStore()
+
+	rich := awsRecord("svc--staging", "v1")
+	rich.ClientConfig = map[string]any{"template": "lambda"}
+	if _, err := Register(ctx, store, rich, t0); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	bare := ServiceRecord{Stack: "svc--staging", Cloud: CloudAWS, Template: "lambda", Version: "v2"}
+	got, err := Register(ctx, store, bare, t0.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if len(got.ClientConfig) == 0 {
+		t.Fatal("precondition: the merge should have carried the config forward")
+	}
+
+	hist, _ := store.DeployHistory(ctx, "svc--staging", 0)
+	if hist[0].Version != "v2" {
+		t.Fatalf("newest event is %q", hist[0].Version)
+	}
+	if hist[0].ConfigCaptured {
+		t.Error("a configless registration must not claim a snapshot")
+	}
+	if _, found, _ := store.DeployConfig(ctx, "svc--staging", hist[0].ID); found {
+		t.Error("no snapshot object should exist for it either")
+	}
+}
+
+// failingConfigStore drops snapshot writes, like an S3 PutObject that
+// 503s.
+type failingConfigStore struct {
+	Store
+	calls int
+}
+
+func (f *failingConfigStore) PutDeployConfig(context.Context, string, string, map[string]any) error {
+	f.calls++
+	return errors.New("s3: service unavailable")
+}
+
+// TestRegister_SnapshotFailureIsNotFatal — registration is non-fatal
+// for the PLUGIN (a dashboard outage must never fail an unrelated
+// deploy), and the snapshot is the least important part of it. Losing
+// one diff is acceptable; losing the registration, and with it the
+// service's presence on the dashboard, is not.
+func TestRegister_SnapshotFailureIsNotFatal(t *testing.T) {
+	ctx := context.Background()
+	store := &failingConfigStore{Store: NewInMemoryStore()}
+
+	rec := awsRecord("svc--staging", "v1")
+	rec.ClientConfig = map[string]any{"template": "lambda"}
+	got, err := Register(ctx, store, rec, t0)
+	if err != nil {
+		t.Fatalf("a failed snapshot write killed the registration: %v", err)
+	}
+	if got.Version != "v1" {
+		t.Errorf("record not stored: %+v", got)
+	}
+	if store.calls != 1 {
+		t.Errorf("PutDeployConfig calls = %d, want 1", store.calls)
+	}
+
+	hist, _ := store.DeployHistory(ctx, "svc--staging", 0)
+	if len(hist) != 1 {
+		t.Fatalf("want the event anyway, got %d", len(hist))
+	}
+	if hist[0].ConfigCaptured {
+		t.Error("ConfigCaptured must stay false when the write failed — otherwise the read path fetches a snapshot that isn't there and has to guess why")
+	}
+}
+
+// TestDelete_RemovesConfigSnapshots — same reasoning as
+// TestDelete_RemovesHistoryToo: a re-registered stack must not inherit
+// the previous incarnation's snapshots, and the bucket must not keep
+// paying for them.
+func TestDelete_RemovesConfigSnapshots(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryStore()
+	rec := awsRecord("gone--staging", "v1")
+	rec.ClientConfig = map[string]any{"template": "lambda"}
+	if _, err := Register(ctx, store, rec, t0); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	hist, _ := store.DeployHistory(ctx, "gone--staging", 0)
+	if len(hist) != 1 || !hist[0].ConfigCaptured {
+		t.Fatalf("precondition: %+v", hist)
+	}
+
+	if err := store.Delete(ctx, "gone--staging"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, found, _ := store.DeployConfig(ctx, "gone--staging", hist[0].ID); found {
+		t.Error("snapshot survived delete")
+	}
+}
+
+// TestDeployConfig_MissingIsNotAnError — "never captured" is a normal
+// answer for every deploy that predates this slice, and the read path
+// renders it as a stated reason. Only a transport failure is an error.
+func TestDeployConfig_MissingIsNotAnError(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryStore()
+	for _, id := range []string{"no-such-event", ""} {
+		cfg, found, err := store.DeployConfig(ctx, "svc--staging", id)
+		if err != nil {
+			t.Errorf("DeployConfig(%q) errored: %v", id, err)
+		}
+		if found || cfg != nil {
+			t.Errorf("DeployConfig(%q) = (%v, %v)", id, cfg, found)
+		}
 	}
 }
 
