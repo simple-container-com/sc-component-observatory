@@ -68,8 +68,18 @@ const (
 	// snapshot as an event and dropping a deploy from the timeline.
 	deployConfigsDir = "deploy-configs"
 	jsonFileExt      = ".json"
-	maxEventScan     = 500
 )
+
+// MaxHistoryScan bounds how many deploy objects one history read will
+// open. A long-lived service accumulates one object per deploy forever
+// and the dashboard only ever renders a page.
+//
+// Exported because the API layer must be able to SAY when it hit this.
+// A paginated timeline that silently stops at object 500 looks exactly
+// like a service whose first deploy was its 500th-from-last, and
+// "absent" rendering as "that is all there is" is the failure this
+// component exists to avoid.
+const MaxHistoryScan = 500
 
 // encodeStack makes a stack name safe for one path segment. Only
 // characters that would change the key's shape are escaped, so the
@@ -225,11 +235,13 @@ func (s *ColocatedStore) DeployHistory(ctx context.Context, stack string, limit 
 	if err != nil {
 		return nil, fmt.Errorf("list deploys: %w", err)
 	}
-	// Cap the fan-out: a long-lived service accumulates one object per
-	// deploy forever, and the dashboard only ever renders a page.
-	if len(objs) > maxEventScan {
+	// Cap the fan-out (MaxHistoryScan). Newest by object mtime, which is
+	// a proxy for deploy time — the authoritative order comes from the
+	// decoded events below, but the choice of WHICH objects to open has
+	// only the listing to go on.
+	if len(objs) > MaxHistoryScan {
 		sort.Slice(objs, func(i, j int) bool { return objs[i].ModifiedAt.After(objs[j].ModifiedAt) })
-		objs = objs[:maxEventScan]
+		objs = objs[:MaxHistoryScan]
 	}
 	out := make([]DeployEvent, 0, len(objs))
 	for _, o := range objs {

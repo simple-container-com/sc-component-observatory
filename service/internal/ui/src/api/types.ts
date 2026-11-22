@@ -115,8 +115,23 @@ export interface DeployEvent {
 
 export interface DeploysResponse {
   stack: string;
+  /** Rows on THIS page. */
   count: number;
+  /**
+   * Deploys the store could see, so the UI can say "20 of 63" instead
+   * of implying a page is the whole history.
+   */
+  total: number;
   deploys: DeployEvent[];
+  /** Absent when this is the oldest page. */
+  next_cursor?: string;
+  /**
+   * The store's history scan cap was reached. Set on every page, not
+   * just the last one, because the end of a capped timeline is
+   * indistinguishable from the first deploy unless it is named.
+   */
+  capped?: boolean;
+  cap_reason?: string;
 }
 
 export interface HealthResult {

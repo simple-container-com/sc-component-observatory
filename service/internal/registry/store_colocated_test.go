@@ -263,7 +263,7 @@ func TestColocated_RegisterMergeRulesHold(t *testing.T) {
 //
 // The prefix isolation is the load-bearing part: DeployHistory LISTs
 // the deploys prefix and decodes EVERY object it finds (up to
-// maxEventScan) to order the timeline. A snapshot stored under that
+// MaxHistoryScan) to order the timeline. A snapshot stored under that
 // same prefix would be decoded on every timeline read — a compose block
 // per row, for a read that only needs ids and timestamps — and would
 // also masquerade as an event with empty fields.
