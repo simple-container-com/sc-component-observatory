@@ -761,19 +761,25 @@ func TestLogs_ShortPageOffersNoCursor(t *testing.T) {
 	}
 }
 
-// TestCapabilitiesAndRefusals — the interface is complete, and the two
-// unimplemented reads refuse with a reason instead of returning nothing.
+// TestCapabilitiesAndRefusals — the interface is complete, and the read
+// that is not implemented yet refuses with a reason instead of
+// returning nothing.
 func TestCapabilitiesAndRefusals(t *testing.T) {
 	p := newProvider(t, &fakeCW{})
 	caps := p.Capabilities()
 	if !caps.Logs {
-		t.Error("logs capability must be true in slice 2a")
+		t.Error("logs capability must be true")
 	}
-	if caps.Metrics || caps.Workloads {
-		t.Error("metrics/workloads must report false until they are implemented")
+	if !caps.Metrics {
+		t.Error("metrics capability must be true now that GetMetricData is wired")
 	}
+	if caps.Workloads {
+		t.Error("workloads must report false until it is implemented")
+	}
+	// A metric query with no window is a refusal, not an empty set — the
+	// same contract the log path has.
 	if _, err := p.Metrics(context.Background(), telemetry.MetricQuery{}); err == nil {
-		t.Error("Metrics must refuse rather than return an empty series set")
+		t.Error("Metrics must refuse a query with no usable window")
 	}
 	if _, err := p.Workloads(context.Background(), telemetry.WorkloadQuery{}); err == nil {
 		t.Error("Workloads must refuse rather than return an empty list")

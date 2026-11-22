@@ -20,8 +20,8 @@ func (s stubProvider) Logs(context.Context, LogQuery) (LogPage, error) {
 	return LogPage{Events: []LogEvent{}, Queried: []string{}, Warnings: []string{}}, nil
 }
 
-func (s stubProvider) Metrics(context.Context, MetricQuery) ([]Series, error) {
-	return nil, Unsupported(s.name, "metrics")
+func (s stubProvider) Metrics(context.Context, MetricQuery) (MetricResult, error) {
+	return MetricResult{}, Unsupported(s.name, "metrics")
 }
 
 func (s stubProvider) Workloads(context.Context, WorkloadQuery) ([]Workload, error) {
