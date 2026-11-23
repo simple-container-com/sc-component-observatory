@@ -63,6 +63,19 @@ type ObservatoryConfig struct {
 	// password the SPA's login validates. Required for the operator UI.
 	OperatorPassword string `json:"operatorPassword,omitempty" yaml:"operatorPassword,omitempty"`
 
+	// MigrationToken is a `${secret:...}` reference to the bearer the
+	// one-off `POST /admin/migrate-s3-to-goembedb` endpoint demands. Set
+	// it for the duration of the S3 → go-embedb cutover and REMOVE it
+	// afterwards: absent, the service does not mount the route at all,
+	// which is the steady state.
+	//
+	// Not a plain env var by design. Like SigningKey and
+	// OperatorPassword it is bound through ComponentSecretEnvMap, so the
+	// value lands in a per-function SecretsManager entry and the service
+	// resolves the ARN at startup — the token that can rewrite the whole
+	// datastore should not be readable from the Lambda's environment.
+	MigrationToken string `json:"migrationToken,omitempty" yaml:"migrationToken,omitempty"`
+
 	// Ingress declares the public entry point. The hostname is also how
 	// the service learns its OWN url — the plugin derives it at
 	// PreProvision, so it is never written twice.

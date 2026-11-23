@@ -72,6 +72,9 @@ my-observatory:
     signingKey:       "${secret:observatory-signing-key}"
     operatorPassword: "${secret:observatory-operator-password}"
     schedulerToken:   "${secret:observatory-scheduler-token}"
+    # Only during the S3 -> go-embedb cutover; see Storage below.
+    # Remove it afterwards and the migration route is not mounted.
+    # migrationToken: "${secret:observatory-migration-token}"
     # REQUIRED, and the one block that is not derivable. Without it
     # nothing ever probes: the service runs the sweep inline when its
     # tick endpoint is called and nothing calls it on its own, and a
@@ -181,23 +184,56 @@ secret — see the fleet convention in `forge/CLAUDE.md` §"Secret management".
 
 Opt-in, operator-driven, reversible.
 
-1. Deploy with `USE_GOEMBEDB=0` (default). No behaviour change.
-2. Set `ADMIN_MIGRATION_TOKEN=<random-value>` in the stack env and redeploy.
-3. Dry-run — lists keys, confirms source + sink reachable, no write:
+**The flag goes on FIRST.** The go-embedb database *is* the migration sink, and
+it is only booted under `USE_GOEMBEDB=1` — with the flag off there is nothing to
+migrate into, and the endpoint answers 500 naming what is missing. So the order
+is **flip → dry-run → migrate**, and there is a window in the middle where the
+service serves an empty store while S3 still holds everything.
+
+1. **Redeploy with the flag on, replication configured, and the migration token
+   set:**
+   ```yaml
+   my-observatory:
+     config:
+       migrationToken: "${secret:observatory-migration-token}"   # remove after cutover
+       env:
+         USE_GOEMBEDB: "1"
+         GOEMBEDB_S3_BUCKET: "<replication-bucket>"
+   ```
+   `GOEMBEDB_S3_BUCKET` is **not optional on Lambda**: without it the embed logs
+   a warning, falls back to `GOEMBEDB_SQLITE_DIR` (`/tmp/goembedb`) and runs
+   single-node — which on Lambda means the dataset dies with every container
+   recycle. The execution role needs read/write on that bucket prefix.
+
+   `migrationToken` is bound through the component's secret-env wire, so it lands
+   in a per-function SecretsManager entry and the service resolves the ARN at
+   startup. Do **not** write `ADMIN_MIGRATION_TOKEN` under `env:` — that puts the
+   credential that can rewrite the whole datastore in the Lambda's environment.
+
+2. **The empty-store window opens here.** The dashboard lists nothing until step
+   4 completes. Nothing is destroyed: S3 is untouched and the migration reads it
+   read-only. Observatory's state is health ticks and deploy records, so the
+   window costs visibility rather than data.
+
+3. Dry-run — lists keys, counts both sides, confirms source + sink reachable, no
+   write:
    ```sh
    curl -X POST \
-     -H "X-Admin-Token: $ADMIN_MIGRATION_TOKEN" \
+     -H "X-Admin-Token: $TOKEN" \
      "https://<observatory-url>/admin/migrate-s3-to-goembedb?dry_run=1"
    ```
-4. Wet run — upserts every S3 object into Mongo:
+4. Wet run — upserts every S3 object into the embed:
    ```sh
    curl -X POST \
-     -H "X-Admin-Token: $ADMIN_MIGRATION_TOKEN" \
+     -H "X-Admin-Token: $TOKEN" \
      "https://<observatory-url>/admin/migrate-s3-to-goembedb"
    ```
-   Response `verified: true` means every S3 key landed in Mongo. Rerun is idempotent (upsert).
-5. Flip `USE_GOEMBEDB=1` via SC redeploy. Brief write-loss OK (missed health ticks self-heal).
-6. Verify: the dashboard still lists services; `observatory_store_backend{backend="goembedb"} == 1` on `/metrics`.
+   Response `verified: true` means every S3 key landed. Rerun is idempotent (upsert).
+5. Verify: the dashboard lists services again;
+   `observatory_store_backend{backend="goembedb"} == 1` on `/metrics`; a **new**
+   health tick appears in the embed.
+6. **Remove `migrationToken` and redeploy.** Unset, the route is not mounted at
+   all — that is the steady state, not a hardened one.
 
 ### Rollback
 
@@ -216,7 +252,7 @@ Prometheus text at `GET /metrics`, unauthenticated.
 | Env | Effect | Required when |
 |---|---|---|
 | `USE_GOEMBEDB` | `1` → MongoStore, anything else → S3Store. | Opt-in; default is S3. |
-| `GOEMBEDB_S3_BUCKET` | Shared replication bucket (e.g. `backup-archives--staging`). | `USE_GOEMBEDB=1` AND replication desired. Single-node embed works without it. |
+| `GOEMBEDB_S3_BUCKET` | Shared replication bucket (e.g. `backup-archives--staging`). | `USE_GOEMBEDB=1`. **Effectively mandatory on Lambda** — unset only warns and falls back to single-node on `/tmp`, which dies with every container recycle. |
 | `GOEMBEDB_S3_PREFIX` | Key namespace in the bucket. | Optional. Default `sc-component-observatory/`. |
 | `GOEMBEDB_S3_REGION` | AWS region for the bucket. | Optional; falls back to `AWS_REGION`. |
 | `GOEMBEDB_REPLSET_NAME` | Replica-set label. | Optional. Default `observatory`. |
@@ -224,7 +260,7 @@ Prometheus text at `GET /metrics`, unauthenticated.
 | `GOEMBEDB_ACK_WAIT_LIVE_ONLY` | `1` forces Bug 13 Lambda semantics on. | Auto-set on Lambda; explicit only for non-Lambda smokes. |
 | `GOEMBEDB_HEARTBEAT_TTL` | Slot heartbeat TTL. | Optional. Defaults to `3m` on Lambda. |
 | `GOEMBEDB_MAX_REPLICAS` | Hard cap on writer slots. | Optional. Defaults to `10` on Lambda. |
-| `ADMIN_MIGRATION_TOKEN` | Enables `/admin/migrate-s3-to-goembedb`. | Only during cutover. Unset to disable the route entirely. |
+| `ADMIN_MIGRATION_TOKEN` | Enables `/admin/migrate-s3-to-goembedb`. Emitted by the plugin from the `migrationToken` config key, so it arrives as a SecretsManager ARN and is resolved at startup — do not set it under `env:` by hand. | Only during cutover. Unset to disable the route entirely. |
 
 ## License
 

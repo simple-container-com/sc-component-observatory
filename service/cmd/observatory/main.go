@@ -13,6 +13,10 @@
 //	                                 registration JWTs. May arrive as a
 //	                                 SecretsManager ARN (see secret_resolver.go).
 //	OBSERVATORY_OPERATOR_PASSWORD    shared operator login secret; same ARN caveat.
+//	ADMIN_MIGRATION_TOKEN            bearer for the one-off
+//	                                 POST /admin/migrate-s3-to-goembedb; same ARN
+//	                                 caveat. Absent ⇒ the route is not mounted,
+//	                                 which is the steady state.
 //	STORAGE_TYPE                     s3 | filesystem        (default s3)
 //	STORAGE_BUCKET                   bucket for s3
 //	STORAGE_REGION                   region for s3          (default eu-central-1)
@@ -110,6 +114,18 @@ func run() error {
 	operatorPassword, err := resolveAWSSecretARN(ctx, "OBSERVATORY_OPERATOR_PASSWORD", os.Getenv("OBSERVATORY_OPERATOR_PASSWORD"))
 	if err != nil {
 		return fmt.Errorf("resolve OBSERVATORY_OPERATOR_PASSWORD: %w", err)
+	}
+
+	// Resolved HERE, with the other two, and not at the mount site
+	// below: the plugin binds this through ComponentSecretEnvMap, so on
+	// a deployed Component the env var holds a SecretsManager ARN and
+	// not the token. Comparing an operator's bearer against an ARN
+	// string fails every request while looking perfectly configured —
+	// and `ctx` carries a 30s budget from the top of run(), which an
+	// embedded-go-embedb boot can eat before the mount site is reached.
+	migrationToken, err := resolveAWSSecretARN(ctx, "ADMIN_MIGRATION_TOKEN", os.Getenv("ADMIN_MIGRATION_TOKEN"))
+	if err != nil {
+		return fmt.Errorf("resolve ADMIN_MIGRATION_TOKEN: %w", err)
 	}
 
 	// --- storage -----------------------------------------------------
@@ -225,11 +241,11 @@ func run() error {
 	// go-embedb cutover, NOT a steady-state route. Source may be nil
 	// if USE_GOEMBEDB=1 was deployed without STORAGE_BUCKET, in which
 	// case the endpoint returns a 500 that names what is missing.
-	if adminToken := os.Getenv("ADMIN_MIGRATION_TOKEN"); adminToken != "" {
+	if migrationToken != "" {
 		migration := &api.MigrationConfig{
 			Source:     migrationSource,
 			Sink:       migrationSink,
-			AdminToken: adminToken,
+			AdminToken: migrationToken,
 		}
 		mux.HandleFunc("POST /admin/migrate-s3-to-goembedb", migration.Migrate)
 	}
