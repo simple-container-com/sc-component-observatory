@@ -249,6 +249,15 @@ func (p *observatoryPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaReques
 				// presents on the tick. Scoped to that one route, so the
 				// credential in the rule's input can only fire a sweep.
 				"schedulerToken",
+				// The bearer the one-off S3 → go-embedb migration
+				// endpoint demands. Bound through ComponentSecretEnvMap
+				// below rather than written into `env`, so the token
+				// that can rewrite the whole datastore lands in a
+				// per-function SecretsManager entry instead of the
+				// Lambda's environment. Set for the cutover, removed
+				// afterwards — absent, the service never mounts the
+				// route.
+				"migrationToken",
 				// Grandfather for the aws-lambda template's
 				// per-Component resource naming (sc-plugin-aws#28): keeps
 				// a Component deployed BEFORE that scoping on its
@@ -279,6 +288,7 @@ func (p *observatoryPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaReques
 			observatoryApi.ResourceType: {Entries: map[string]string{
 				"signingKey":       "SERVICE_JWT_SECRET",
 				"operatorPassword": "OBSERVATORY_OPERATOR_PASSWORD",
+				"migrationToken":   "ADMIN_MIGRATION_TOKEN",
 			}},
 		},
 	}, nil
