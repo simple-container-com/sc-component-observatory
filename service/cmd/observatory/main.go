@@ -113,10 +113,68 @@ func run() error {
 	}
 
 	// --- storage -----------------------------------------------------
-	objects, location, err := buildObjectStore(ctx)
-	if err != nil {
-		return fmt.Errorf("object store: %w", err)
+	//
+	// Two code paths:
+	//
+	//   USE_GOEMBEDB unset or "0" (DEFAULT): S3Store. Current production.
+	//   USE_GOEMBEDB=1                     : MongoStore on top of an
+	//                                        embedded go-embedb (ferretdb
+	//                                        + sqlite + S3 replication).
+	//
+	// A migration endpoint copies S3 → Mongo under an admin token so an
+	// operator flips the env only AFTER a dry-run shows count parity. See
+	// forge/docs/roadmap/items/sc-component-observatory-goembedb-migration.md.
+	//
+	// migrationSource stays non-nil whenever we built an S3Store, so the
+	// `/admin/migrate-s3-to-goembedb` endpoint has a source regardless of
+	// which backend serves the live traffic.
+	var (
+		objects         storage.Store
+		location        string
+		migrationSource storage.Store
+		migrationSink   *storage.MongoStore
+	)
+	useGoEmbedb := envOr("USE_GOEMBEDB", "") == "1"
+
+	// Always build the S3 source when STORAGE_TYPE=s3 (default), both
+	// as the live backend and as the migration source. A deploy with
+	// USE_GOEMBEDB=1 but no S3 wiring is still valid — the migration
+	// just has no source to pull from.
+	if envOr("STORAGE_TYPE", "s3") == "s3" {
+		s3Store, loc, serr := buildObjectStore(ctx)
+		if serr != nil && !useGoEmbedb {
+			return fmt.Errorf("object store: %w", serr)
+		}
+		if serr == nil {
+			migrationSource = s3Store
+			objects = s3Store
+			location = loc
+		}
+	} else if !useGoEmbedb {
+		// Non-S3 storage types (filesystem) go through the regular builder.
+		st, loc, serr := buildObjectStore(ctx)
+		if serr != nil {
+			return fmt.Errorf("object store: %w", serr)
+		}
+		objects = st
+		location = loc
 	}
+
+	if useGoEmbedb {
+		embed, berr := bootGoEmbed(slog.Default())
+		if berr != nil {
+			return fmt.Errorf("goembedb boot: %w", berr)
+		}
+		mongoStore := storage.NewMongoStore(embed.Client)
+		migrationSink = mongoStore
+		objects = mongoStore
+		location = "goembedb://" + embed.ReplSet
+	}
+
+	if objects == nil {
+		return errors.New("no storage backend configured (USE_GOEMBEDB unset and buildObjectStore returned nil)")
+	}
+	api.SetStoreBackend(backendLabel(useGoEmbedb))
 
 	// --- registry ----------------------------------------------------
 	metaType := envOr("METADATA_TYPE", "colocated")
@@ -155,6 +213,26 @@ func run() error {
 	mux.HandleFunc("GET /api/v1/session", session.Session)
 	mux.HandleFunc("POST /api/v1/login", session.Login)
 	mux.HandleFunc("POST /api/v1/logout", session.Logout)
+
+	// Prometheus text-exposition. Unauthenticated: it exposes no
+	// tenant-scoped data, only process-level counters + the
+	// observatory_store_backend{backend="s3"|"goembedb"} gauge an
+	// operator alerts on after flipping USE_GOEMBEDB.
+	mux.Handle("GET /metrics", api.MetricsHandler())
+
+	// Migration endpoint. Disabled unless ADMIN_MIGRATION_TOKEN is
+	// set — the endpoint is a one-off operator tool for the S3 →
+	// go-embedb cutover, NOT a steady-state route. Source may be nil
+	// if USE_GOEMBEDB=1 was deployed without STORAGE_BUCKET, in which
+	// case the endpoint returns a 500 that names what is missing.
+	if adminToken := os.Getenv("ADMIN_MIGRATION_TOKEN"); adminToken != "" {
+		migration := &api.MigrationConfig{
+			Source:     migrationSource,
+			Sink:       migrationSink,
+			AdminToken: adminToken,
+		}
+		mux.HandleFunc("POST /admin/migrate-s3-to-goembedb", migration.Migrate)
+	}
 
 	// Authenticated surface.
 	mux.Handle("GET /api/v1/services", auth(http.HandlerFunc(services.List)))
@@ -232,6 +310,7 @@ func run() error {
 		"starting sc-component-observatory",
 		"version", version, "commit", commit,
 		"storage", location, "metadata", metaType,
+		"backend", backendLabel(useGoEmbedb),
 		"telemetry_clouds", logsCfg.Providers.Clouds(),
 		"operator_password_set", operatorPassword != "",
 		"self_url", os.Getenv("OBSERVATORY_SELF_URL"),
@@ -377,4 +456,13 @@ func envOr(name, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// backendLabel maps the boolean flag to the Prometheus label value the
+// gauge records. Centralised so the boot log and the gauge agree.
+func backendLabel(useGoEmbedb bool) string {
+	if useGoEmbedb {
+		return "goembedb"
+	}
+	return "s3"
 }
