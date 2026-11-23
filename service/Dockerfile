@@ -13,7 +13,7 @@
 #   COMMIT    NOT auto-injected. The deploy action exports GITHUB_SHA;
 #             the release workflow passes it through.
 
-ARG GOLANG_VERSION=1.27-alpine
+ARG GOLANG_VERSION=1.26-alpine
 
 # Plain amazonlinux (NOT lambda/provided) so the container's own
 # ENTRYPOINT runs directly without lambda-entrypoint.sh demanding a
@@ -49,14 +49,8 @@ ARG COMMIT=""
 # CGO off for a static binary that runs on any glibc/musl base.
 # -trimpath keeps build paths out of the binary; -s -w drop the symbol
 # table and DWARF, which is a meaningful size win on a Lambda image.
-# -buildvcs=false: go-embedb's build/version/version.go init() panics
-# when the git-derived vcs.revision disagrees with commit.txt. In an
-# SC build the git tree in /src ≠ what go stamps as vcs.revision.
-# Harmless when USE_GOEMBEDB=0 (the dep still links) and required when
-# USE_GOEMBEDB=1.
 RUN CGO_ENABLED=0 GOOS=linux go build \
       -trimpath \
-      -buildvcs=false \
       -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
       -o /out/observatory \
       ./cmd/observatory
