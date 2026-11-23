@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/simple-container-com/sc-component-observatory/service/internal/notify"
 	"github.com/simple-container-com/sc-component-observatory/service/internal/registry"
 )
 
@@ -240,16 +241,35 @@ type SweepConfig struct {
 
 	// Now is injected for tests.
 	Now func() time.Time
+
+	// Events publishes health EDGES to sc-component-notifier. Nil or
+	// disabled means the sweep still detects and returns transitions —
+	// they show up in the tick response and the SPA either way — and
+	// just tells nobody.
+	Events notify.Publisher
 }
 
-// Sweep probes every registered service and records the results.
+// SweepOutcome is one pass's product: the levels it recorded and the
+// edges it found in them.
+//
+// Both, not one: the levels are what the dashboard renders, the edges
+// are what gets anyone out of bed. Returning only the levels is what
+// the component did for its first two months, and it is why an outage
+// was something you discovered rather than something you were told.
+type SweepOutcome struct {
+	Results     []registry.HealthResult `json:"results"`
+	Transitions []Transition            `json:"transitions,omitempty"`
+}
+
+// Sweep probes every registered service, records the results, and
+// returns both the levels and the EDGES found in them.
 //
 // Returns the results it recorded. Errors on individual services are
 // recorded AS results (status down, error set) rather than returned:
 // the point of a sweep is to produce a health picture, and aborting the
 // whole pass because one service is unreachable would lose the
 // information about every service after it.
-func Sweep(ctx context.Context, store registry.Store, prober Prober, cfg SweepConfig) ([]registry.HealthResult, error) {
+func Sweep(ctx context.Context, store registry.Store, prober Prober, cfg SweepConfig) (SweepOutcome, error) {
 	if cfg.DefaultPath == "" {
 		cfg.DefaultPath = "/healthz"
 	}
@@ -262,7 +282,7 @@ func Sweep(ctx context.Context, store registry.Store, prober Prober, cfg SweepCo
 
 	records, err := store.List(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list services: %w", err)
+		return SweepOutcome{}, fmt.Errorf("list services: %w", err)
 	}
 
 	type job struct {
@@ -349,12 +369,25 @@ func Sweep(ctx context.Context, store registry.Store, prober Prober, cfg SweepCo
 	}
 	wg.Wait()
 
+	// Edge detection BEFORE the persist loop, and the ordering is the
+	// whole contract: once PutHealth has run, LatestHealth returns the
+	// result we just wrote and every transition has been erased.
+	transitions := DetectTransitions(ctx, store, results)
+
 	for _, res := range results {
 		// Best-effort persist: a storage hiccup on one result must not
 		// discard the rest of the sweep.
 		_ = store.PutHealth(ctx, res)
 	}
-	return results, nil
+
+	// Notify after the persist, not before. If the process dies between
+	// the two, the next tick re-reads the same prior and re-detects the
+	// same edge — one delayed notification. The other order risks
+	// paging about a transition that was never recorded, which an
+	// operator then cannot find anywhere in the SPA.
+	PublishTransitions(ctx, cfg.Events, transitions)
+
+	return SweepOutcome{Results: results, Transitions: transitions}, nil
 }
 
 // JoinHealthURL joins an endpoint base and a health path without

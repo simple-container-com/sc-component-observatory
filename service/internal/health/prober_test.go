@@ -181,8 +181,8 @@ func TestSweep_FallsBackToHealthOn404(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
-	if len(res) != 1 || res[0].Status != registry.HealthUp {
-		t.Fatalf("status = %+v, want up via the /health fallback", res)
+	if len(res.Results) != 1 || res.Results[0].Status != registry.HealthUp {
+		t.Fatalf("status = %+v, want up via the /health fallback", res.Results)
 	}
 	if len(paths) != 2 || paths[0] != "/healthz" || paths[1] != "/health" {
 		t.Errorf("paths probed = %v, want [/healthz /health]", paths)
@@ -218,8 +218,8 @@ func TestSweep_DeclaredPathIsNotSecondGuessed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
-	if res[0].Status != registry.HealthDown {
-		t.Errorf("status = %q, want down — a declared path must not be second-guessed", res[0].Status)
+	if res.Results[0].Status != registry.HealthDown {
+		t.Errorf("status = %q, want down — a declared path must not be second-guessed", res.Results[0].Status)
 	}
 	if len(paths) != 1 || paths[0] != "/ping" {
 		t.Errorf("paths probed = %v, want only [/ping]", paths)
