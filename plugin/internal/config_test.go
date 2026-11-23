@@ -6,6 +6,9 @@ package observatory
 import (
 	"strings"
 	"testing"
+
+	"github.com/simple-container-com/api/pkg/api"
+	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 )
 
 func TestNormalizeURL(t *testing.T) {
@@ -18,6 +21,11 @@ func TestNormalizeURL(t *testing.T) {
 		{"https://observatory.example.com/", "https://observatory.example.com"},
 		{"http://localhost:8080", "http://localhost:8080"}, // explicit http preserved for local dev
 		{"  obs.example.com  ", "https://obs.example.com"},
+		// Trailing whitespace AND a trailing slash: the case the
+		// original trim order got wrong, because TrimRight ran before
+		// TrimSpace and so saw the space, not the slash. The result was
+		// `https://host/` and a registration POST to `//api/v1/...`.
+		{"  https://obs.example.com///  ", "https://obs.example.com"},
 		{"", ""},
 	} {
 		if got := normalizeURL(tc.in); got != tc.want {
@@ -154,5 +162,78 @@ func TestBucketForStorageRef(t *testing.T) {
 	// An env-less dispatch must not append a dangling separator.
 	if got := BucketForStorageRef(map[string]any{"storage": "data"}, "obs", ""); got != "data" {
 		t.Errorf("empty env: got %q, want data", got)
+	}
+}
+
+// depOutputs builds dependency outputs the way SC core's
+// DependencyOutputsFromComputeProcessRequest builds them
+// (api/pkg/plugin/runtime/compute.go:125) — a *ResourceOutput whose only
+// field is Ref, holding a *PluginResourceOutput.
+//
+// Building the fixture any other way is what let the dead type
+// assertion in lookupDepString survive unnoticed: it asserted the
+// *ResourceOutput POINTER against map[string]any, so the first branch
+// of readServiceURL's cascade could never fire and a live
+// `_endpoint_url` was always discarded in favour of `ingress.hostname`.
+func depOutputs(resource string, values map[string]any) pApi.ResourcesOutputs {
+	outs := map[string]api.PluginOutputValue{}
+	for k, v := range values {
+		outs[k] = api.PluginOutputValue{Value: v}
+	}
+	return pApi.ResourcesOutputs{
+		resource: &api.ResourceOutput{
+			Ref: &api.PluginResourceOutput{
+				PluginName: "sc-plugin-aws",
+				Urn:        "urn:pulumi:test::forge::" + resource,
+				Outputs:    outs,
+			},
+		},
+	}
+}
+
+// The live endpoint must beat the DNS name. This is branch 1 of
+// readServiceURL's own documented cascade, and it was unreachable until
+// 2026-11-23 — see lookupDepString.
+func TestDependencyEndpointURLWinsOverIngressHostname(t *testing.T) {
+	p := NewProcessor(ProcessorConfig{})
+
+	in := inputWithRaw(map[string]any{
+		"ingress": map[string]any{"hostname": "monitor.simple-forge.com"},
+	})
+	params := pApi.ProvisionParams{
+		ResourceOutputs: depOutputs("my-observatory", map[string]any{
+			"_endpoint_url": "https://abc123.lambda-url.eu-central-1.on.aws/",
+		}),
+	}
+
+	got, err := p.readServiceURL(in, params)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := "https://abc123.lambda-url.eu-central-1.on.aws"; got != want {
+		t.Errorf("got %q, want %q (the published endpoint, trailing slash stripped)", got, want)
+	}
+
+	// `_deployed_service` is the other spelling, and a bare hostname
+	// there must still acquire a scheme.
+	got, err = p.readServiceURL(inputWithRaw(map[string]any{}), pApi.ProvisionParams{
+		ResourceOutputs: depOutputs("my-observatory", map[string]any{
+			"_deployed_service": "abc123.lambda-url.eu-central-1.on.aws",
+		}),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := "https://abc123.lambda-url.eu-central-1.on.aws"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+
+	// An output under the right key but a non-string value is not a
+	// URL: falling through to the error is correct, rendering
+	// "%!s(int=8080)" into a POST target is not.
+	if _, err := p.readServiceURL(inputWithRaw(map[string]any{}), pApi.ProvisionParams{
+		ResourceOutputs: depOutputs("my-observatory", map[string]any{"_endpoint_url": 8080}),
+	}); err == nil {
+		t.Error("a non-string endpoint output must not resolve")
 	}
 }
