@@ -22,6 +22,13 @@
 //	STORAGE_PATH                     mount point for filesystem
 //	STORAGE_ACCESS_KEY / _SECRET_KEY optional; prefer the execution role
 //	METADATA_TYPE                    colocated               (default; only one in slice 1)
+//	NOTIFY_URL                       sc-component-notifier base URL. Both this
+//	                                 and NOTIFY_TOKEN absent ⇒ health edges are
+//	                                 computed but published nowhere. Exactly one
+//	                                 of them set is a STARTUP FAILURE, not a
+//	                                 warning — see internal/notify.
+//	NOTIFY_TOKEN                     the notifier-minted `op:"event"` JWT for
+//	                                 this stack.
 //	PORT                             HTTP port               (default 8080)
 //
 // Telemetry knobs — all optional, and all of them LOWER a limit rather
@@ -61,6 +68,7 @@ import (
 
 	"github.com/simple-container-com/sc-component-observatory/service/internal/api"
 	"github.com/simple-container-com/sc-component-observatory/service/internal/health"
+	"github.com/simple-container-com/sc-component-observatory/service/internal/notify"
 	"github.com/simple-container-com/sc-component-observatory/service/internal/registry"
 	"github.com/simple-container-com/sc-component-observatory/service/internal/storage"
 	"github.com/simple-container-com/sc-component-observatory/service/internal/telemetry"
@@ -167,11 +175,33 @@ func run() error {
 	// other mutating route: on Lambda the EventBridge rule carries a
 	// bearer token, the same shape sc-component-backup uses for its
 	// own scheduler tick.
+	// Publisher for sc-component-notifier. NOTIFY_URL/NOTIFY_TOKEN are
+	// landed by this component's plugin from the operator's `notify:`
+	// block; both absent means notifications are off and NewEmitter
+	// returns a no-op.
+	//
+	// A construction error is FATAL on purpose. It only happens when
+	// the wiring is half-done — a URL with no token (every event would
+	// 401), or a URL still holding an unresolved `$sc:…` placeholder —
+	// and both would otherwise surface for the first time at the moment
+	// an operator was relying on being paged. A deploy that fails here
+	// is strictly better than a monitor that watches the fleet and tells
+	// nobody.
+	eventPublisher, err := notify.NewEmitter(notify.EmitterConfig{
+		BaseURL: os.Getenv("NOTIFY_URL"),
+		Token:   os.Getenv("NOTIFY_TOKEN"),
+		SelfURL: os.Getenv("OBSERVATORY_SELF_URL"),
+	})
+	if err != nil {
+		return fmt.Errorf("notify publisher: %w", err)
+	}
+
 	healthCfg := &api.HealthConfig{
 		Registry:    reg,
 		Prober:      health.NewHTTPProber(time.Duration(envInt("HEALTHCHECK_TIMEOUT_SECONDS", 5)) * time.Second),
 		DefaultPath: envOr("HEALTHCHECK_PATH", "/healthz"),
 		RetainDays:  envInt("HEALTHCHECK_RETAIN_DAYS", 30),
+		Events:      eventPublisher,
 	}
 	mux.Handle("POST /api/v1/scheduler/healthcheck/tick", auth(http.HandlerFunc(healthCfg.Tick)))
 	mux.Handle("GET /api/v1/services/{stack}/health", auth(http.HandlerFunc(healthCfg.History)))

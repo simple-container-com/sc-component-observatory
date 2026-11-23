@@ -5,9 +5,11 @@ package observatory
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/pkg/errors"
+
 	"github.com/simple-container-com/api/pkg/api"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 )
@@ -104,13 +106,49 @@ func (p *Processor) readServiceURL(input api.ResourceInput, params pApi.Provisio
 
 // lookupDepString searches the sibling-resource outputs for a string
 // value under `key`, across every resource that published one.
+//
+// The published values are NOT on the `*api.ResourceOutput` itself —
+// that type is `struct{ Ref any }` and nothing else. A plugin-owned
+// resource leaves an `*api.PluginResourceOutput` on `.Ref` and the
+// values live in its `Outputs map[string]PluginOutputValue`
+// (api/pkg/api/plugin_resource_output.go). Until 2026-11-23 this
+// function type-asserted the *ResourceOutput POINTER against
+// `map[string]any`, which a struct pointer can never satisfy — so the
+// first and most trustworthy branch of readServiceURL's cascade was
+// unreachable and every resolution fell through to `ingress.hostname`.
+// Nothing went red, because no test built a dependency-output fixture
+// the way the plugin bus builds one (see TestDependencyEndpointURL...).
+// Found while writing the same test for sc-component-notifier, which
+// inherited this file.
+//
+// `map[string]any` is still accepted on `.Ref` because an in-tree
+// (non-plugin) resource may put its own typed output there.
+//
+// Resource names are visited in sorted order: Go map iteration is
+// randomised, so when two dependencies publish the same key an
+// unsorted walk picks a different one per run, with nothing in the diff
+// to explain it.
 func lookupDepString(params pApi.ProvisionParams, key string) string {
-	for _, out := range params.ResourceOutputs {
-		if out == nil {
+	names := make([]string, 0, len(params.ResourceOutputs))
+	for name := range params.ResourceOutputs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		out := params.ResourceOutputs[name]
+		if out == nil || out.Ref == nil {
 			continue
 		}
-		if m, ok := any(out).(map[string]any); ok {
-			if v, ok := m[key].(string); ok && v != "" {
+		switch ref := out.Ref.(type) {
+		case *api.PluginResourceOutput:
+			if v, found := ref.Lookup(key); found {
+				if s, ok := v.Value.(string); ok && s != "" {
+					return s
+				}
+			}
+		case map[string]any:
+			if v, ok := ref[key].(string); ok && v != "" {
 				return v
 			}
 		}
@@ -124,8 +162,13 @@ func lookupDepString(params pApi.ProvisionParams, key string) string {
 // Bare hostnames get https:// — an SC Component always sits behind TLS
 // (a Lambda Function URL or a registrar-managed record), and defaulting
 // to http would produce a redirect-or-fail on every registration.
+//
+// Whitespace comes off FIRST. Trimming slashes from a value that still
+// has a trailing space is a no-op, so `"https://host/ "` kept its
+// trailing slash and every registration POST went to `//api/v1/...`.
+// Shipped in that order until 2026-11-23.
 func normalizeURL(s string) string {
-	s = strings.TrimSpace(strings.TrimRight(s, "/"))
+	s = strings.TrimRight(strings.TrimSpace(s), "/")
 	if s == "" {
 		return ""
 	}

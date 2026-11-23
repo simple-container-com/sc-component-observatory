@@ -12,7 +12,11 @@
 // usable by the plugin's own validation.
 package api
 
-import "github.com/pkg/errors"
+import (
+	"strings"
+
+	"github.com/pkg/errors"
+)
 
 // ResourceType is the token an operator writes under
 // `resources.<env>.resources.<name>.type`.
@@ -101,6 +105,29 @@ type ObservatoryConfig struct {
 	//
 	// Omit entirely for a single-cloud fleet.
 	Readers map[string]string `json:"readers,omitempty" yaml:"readers,omitempty"`
+
+	// Notify points this component at an sc-component-notifier instance,
+	// so a service going down reaches an operator instead of only
+	// changing a colour on the dashboard. Optional: omitted means health
+	// edges are still computed and stored, just published nowhere.
+	//
+	// The plugin also accepts the shorthand `notify: "https://host"`,
+	// which this typed struct cannot express (it is a YAML union of a
+	// string and a mapping, and `yaml.Unmarshal` into a struct rejects
+	// the scalar). The plugin parses the raw config, so both shapes work
+	// in a real server.yaml; this struct documents the mapping form.
+	Notify *Notify `json:"notify,omitempty" yaml:"notify,omitempty"`
+
+	// NotifyToken is a `${secret:...}` ref to the notifier-minted
+	// `op:"event"` JWT for this stack. Required whenever Notify is set.
+	//
+	// A SEPARATE top-level field and deliberately NOT nested under
+	// Notify: applyComponentSecretEnvMap
+	// (api/pkg/clouds/pulumi/component_secret_env.go) reads
+	// `merged[field]` and nothing nested, so a token written under
+	// `notify.token` could never reach the SecretsManager-backed
+	// transport — it would land as plaintext Lambda env, or not at all.
+	NotifyToken string `json:"notifyToken,omitempty" yaml:"notifyToken,omitempty"`
 
 	// Env is optional plain env injected into the deployed container.
 	// An escape hatch, not a configuration surface — if something ends
@@ -290,6 +317,9 @@ func (c *ObservatoryConfig) Validate() error {
 	if err := c.validateStorage(); err != nil {
 		return err
 	}
+	if err := c.validateNotify(); err != nil {
+		return err
+	}
 	return c.validateHealthcheck()
 }
 
@@ -307,6 +337,51 @@ func (c *ObservatoryConfig) validateStorage() error {
 		return errors.Errorf("`storage.type: %s` is declared but not implemented yet for %q — use %q (the default) for now; see the component's README for the slice that adds it", s.Type, ResourceType, StorageResourceS3Bucket)
 	default:
 		return errors.Errorf("unknown `storage.type` %q for %q — expected %q (or the not-yet-implemented %q / %q)", s.Type, ResourceType, StorageResourceS3Bucket, StorageResourceVolume, StorageResourceMongoDB)
+	}
+	return nil
+}
+
+// Notify names where this component publishes operator-relevant events.
+type Notify struct {
+	// URL is the notifier's base URL — either a literal
+	// ("https://notify.simple-forge.com") or an operator-written
+	// reference ("$sc:${resource:my-notifier.self-url}"). The reference
+	// form works because the OPERATOR wrote it, so it rides SC's own
+	// resolution pass; a reference a plugin emits is not re-resolved.
+	URL string `json:"url,omitempty" yaml:"url,omitempty"`
+
+	// Name is the by-reference shape (`notify: my-notifier`). Parsed and
+	// REFUSED for now: a plugin cannot read a sibling resource's
+	// declaration (PreProvisionRequest carries only its own config), so
+	// there is nowhere to look the hostname up. The error hands over the
+	// one line to write instead.
+	Name string `json:"name,omitempty" yaml:"name,omitempty"`
+}
+
+// validateNotify enforces the url+token pair all-or-nothing.
+//
+// Absent is the only silent case, and it has to stay silent: every
+// operator who upgrades this component without asking for notifications
+// must keep deploying exactly as before. Everything else fails the
+// provision — a monitor that deploys with notifications half-wired is
+// the worst available outcome, because the operator believes they are
+// covered and the first thing they learn is that nobody was paged.
+func (c *ObservatoryConfig) validateNotify() error {
+	hasToken := strings.TrimSpace(c.NotifyToken) != ""
+	if c.Notify == nil {
+		if hasToken {
+			return errors.Errorf("`notifyToken` is set but there is no `notify:` block — add `notify: {url: \"https://...\"}` so the token has somewhere to be presented")
+		}
+		return nil
+	}
+	if strings.TrimSpace(c.Notify.URL) == "" {
+		if name := strings.TrimSpace(c.Notify.Name); name != "" {
+			return errors.Errorf("`notify.name: %[1]s` names a resource but no URL: add `notify.url: \"$sc:${resource:%[1]s.self-url}\"`, which SC resolves because you wrote it", name)
+		}
+		return errors.Errorf("`notify:` is declared with no `url` — add `notify.url: \"https://...\"`, or remove the `notify:` block to leave notifications off")
+	}
+	if !hasToken {
+		return errors.Errorf("`notify.url` is set but `notifyToken` is not — the publisher would reach the notifier and be refused with a 401 on its first alert. Mint a publisher token on the notifier, register it with `sc secrets add`, and set `notifyToken: \"${secret:<name>}\"`")
 	}
 	return nil
 }

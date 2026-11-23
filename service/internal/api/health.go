@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/simple-container-com/sc-component-observatory/service/internal/health"
+	"github.com/simple-container-com/sc-component-observatory/service/internal/notify"
 	"github.com/simple-container-com/sc-component-observatory/service/internal/registry"
 )
 
@@ -23,6 +24,11 @@ type HealthConfig struct {
 
 	// RetainDays caps stored results; the sweep prunes past it.
 	RetainDays int
+
+	// Events publishes health EDGES to an sc-component-notifier. Nil
+	// (or a disabled publisher) means notifications are off and the
+	// sweep behaves exactly as it did before they existed.
+	Events notify.Publisher
 
 	// Now is injected for tests.
 	Now func() time.Time
@@ -73,9 +79,10 @@ func (c *HealthConfig) Tick(w http.ResponseWriter, r *http.Request) {
 		prober = health.NewHTTPProber(5 * time.Second)
 	}
 
-	results, err := health.Sweep(r.Context(), c.Registry, prober, health.SweepConfig{
+	outcome, err := health.Sweep(r.Context(), c.Registry, prober, health.SweepConfig{
 		DefaultPath: c.DefaultPath,
 		Now:         c.now,
+		Events:      c.Events,
 	})
 	if err != nil {
 		slog.Error("healthcheck sweep failed", "err", err)
@@ -94,6 +101,8 @@ func (c *HealthConfig) Tick(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	results := outcome.Results
+
 	var up, down, unknown int
 	for _, res := range results {
 		switch res.Status {
@@ -105,7 +114,8 @@ func (c *HealthConfig) Tick(w http.ResponseWriter, r *http.Request) {
 			unknown++
 		}
 	}
-	slog.Info("healthcheck sweep", "probed", len(results), "up", up, "down", down, "unknown", unknown, "pruned", pruned)
+	slog.Info("healthcheck sweep", "probed", len(results), "up", up, "down", down, "unknown", unknown,
+		"transitions", len(outcome.Transitions), "pruned", pruned)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"probed":  len(results),
@@ -114,6 +124,11 @@ func (c *HealthConfig) Tick(w http.ResponseWriter, r *http.Request) {
 		"unknown": unknown,
 		"pruned":  pruned,
 		"results": results,
+		// The edges this sweep found. Reported even when no notifier is
+		// configured, so an operator can see what WOULD have been sent
+		// before wiring one up — and so a smoke can assert the edge
+		// without a Telegram account.
+		"transitions": outcome.Transitions,
 	})
 }
 
