@@ -138,6 +138,94 @@ S3-compatible gateway), GCS, or a filesystem path (a Kubernetes PVC, an EFS moun
 directory) — with structured records colocated as JSON in the same bucket by default, so a
 bucket name is the only storage config required.
 
+### Backends
+
+| Backend | Env flag | State |
+|---|---|---|
+| **S3** (current) | `USE_GOEMBEDB` unset or `0` | Default. S3Store over the configured bucket (`STORAGE_BUCKET`), JSON records under `_meta/`. |
+| **go-embedb** (new) | `USE_GOEMBEDB=1` | MongoStore over an embedded go-embedb (ferretdb + sqlite + S3 active-active replication). Collections: `services`, `deploys`, `deploy_configs`, `health`, `kv`. See [`forge/docs/design/2026-11-22/go-embedb-active-active-s3/`](https://github.com/simple-container-com/forge/tree/main/docs/design/2026-11-22/go-embedb-active-active-s3). |
+
+### Building against go-embedb (a private dependency)
+
+go-embedb is a **private** fork of FerretDB, published under the upstream module path, so
+`service/go.mod` routes it with
+
+```
+replace github.com/FerretDB/FerretDB => github.com/simple-container-com/go-embedb v0.0.0-…
+```
+
+Two properties of that line are load-bearing, and the first one took this repo's `main` red
+once already (`d0c3c19`, reverted by `#23`):
+
+- **It must be a module path + pseudo-version, never a filesystem path.** A sibling-path
+  replace (`=> ../../go-embedb`) resolves only on a machine that happens to have the fork
+  checked out next door. And it fails in `go mod download` — while the module graph is
+  being loaded, *before* any build tag or env var is read — so `USE_GOEMBEDB` defaulting to
+  `0` gates nothing: the S3 path becomes unbuildable too.
+- **A filesystem replace never validates the pseudo-version string**, so a wrong timestamp
+  in it stays invisible until the day the path is swapped for a module path.
+
+Because the fork is private, a build needs a read credential:
+
+| Where | How |
+|---|---|
+| **CI** (`.github/workflows/release.yml`) | `sc secrets reveal --force` materialises `.sc/deploy-keys/go-embedb.pem` from this repo's SC registry, and `docker/build-push-action`'s `secret-files:` mounts it into the `go-builder` stage. The mount is not a layer and not a build-arg, so the key reaches neither the image nor the log. |
+| **Locally** | `sc secrets reveal --force`, then `GOPRIVATE='github.com/simple-container-com/*' GIT_SSH_COMMAND='ssh -i .sc/deploy-keys/go-embedb.pem -o IdentitiesOnly=yes' go mod download`. `GOPRIVATE` is required: without it the public proxy tries the fetch, cannot read a private repo, and reports git's auth failure wrapped as a misleading `invalid version`. |
+
+The key itself is **SC-encrypted in `.sc/secrets.yaml`**, which is committed; the plaintext
+half and `.sc/cfg.*.yaml` are gitignored. The registry is encrypted to the fleet's shared
+recipient set, so the single **org-level `SC_CONFIG`** decrypts it with no per-repo GitHub
+secret — see the fleet convention in `forge/CLAUDE.md` §"Secret management".
+
+### Migration (S3 → go-embedb)
+
+Opt-in, operator-driven, reversible.
+
+1. Deploy with `USE_GOEMBEDB=0` (default). No behaviour change.
+2. Set `ADMIN_MIGRATION_TOKEN=<random-value>` in the stack env and redeploy.
+3. Dry-run — lists keys, confirms source + sink reachable, no write:
+   ```sh
+   curl -X POST \
+     -H "X-Admin-Token: $ADMIN_MIGRATION_TOKEN" \
+     "https://<observatory-url>/admin/migrate-s3-to-goembedb?dry_run=1"
+   ```
+4. Wet run — upserts every S3 object into Mongo:
+   ```sh
+   curl -X POST \
+     -H "X-Admin-Token: $ADMIN_MIGRATION_TOKEN" \
+     "https://<observatory-url>/admin/migrate-s3-to-goembedb"
+   ```
+   Response `verified: true` means every S3 key landed in Mongo. Rerun is idempotent (upsert).
+5. Flip `USE_GOEMBEDB=1` via SC redeploy. Brief write-loss OK (missed health ticks self-heal).
+6. Verify: the dashboard still lists services; `observatory_store_backend{backend="goembedb"} == 1` on `/metrics`.
+
+### Rollback
+
+- Set `USE_GOEMBEDB=0` and redeploy. S3Store reads the pre-migration snapshot. Any writes made during the goembedb window are lost (they are in Mongo only, not back-copied to S3) — acceptable per the cutover decision.
+- Full rollback: `sc destroy` the stack, `aws s3 rm backup-archives--<env>/sc-component-observatory--<env>/ --recursive`, redeploy from the previous commit.
+
+### Operational metrics
+
+Prometheus text at `GET /metrics`, unauthenticated.
+
+- `observatory_store_backend{backend="s3"|"goembedb"}` — 1 for the active backend, 0 for the other. Alert if this disagrees with the configured `USE_GOEMBEDB`.
+- Process + go-embedb replication series when `USE_GOEMBEDB=1` (slot heartbeats, write-concern waits, HLC drift — see the go-embedb operator guide).
+
+### Environment knobs
+
+| Env | Effect | Required when |
+|---|---|---|
+| `USE_GOEMBEDB` | `1` → MongoStore, anything else → S3Store. | Opt-in; default is S3. |
+| `GOEMBEDB_S3_BUCKET` | Shared replication bucket (e.g. `backup-archives--staging`). | `USE_GOEMBEDB=1` AND replication desired. Single-node embed works without it. |
+| `GOEMBEDB_S3_PREFIX` | Key namespace in the bucket. | Optional. Default `sc-component-observatory/`. |
+| `GOEMBEDB_S3_REGION` | AWS region for the bucket. | Optional; falls back to `AWS_REGION`. |
+| `GOEMBEDB_REPLSET_NAME` | Replica-set label. | Optional. Default `observatory`. |
+| `GOEMBEDB_SQLITE_DIR` | Local SQLite directory. | Optional. Default `/tmp/goembedb`. |
+| `GOEMBEDB_ACK_WAIT_LIVE_ONLY` | `1` forces Bug 13 Lambda semantics on. | Auto-set on Lambda; explicit only for non-Lambda smokes. |
+| `GOEMBEDB_HEARTBEAT_TTL` | Slot heartbeat TTL. | Optional. Defaults to `3m` on Lambda. |
+| `GOEMBEDB_MAX_REPLICAS` | Hard cap on writer slots. | Optional. Defaults to `10` on Lambda. |
+| `ADMIN_MIGRATION_TOKEN` | Enables `/admin/migrate-s3-to-goembedb`. | Only during cutover. Unset to disable the route entirely. |
+
 ## License
 
 MIT
