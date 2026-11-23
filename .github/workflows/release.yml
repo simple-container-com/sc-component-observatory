@@ -199,6 +199,10 @@ jobs:
           # exits 0, and the failure would otherwise surface as an opaque
           # `go mod download` auth error 90 seconds into the image build.
           test -s .sc/deploy-keys/go-embedb.pem
+          # buildx mounts the secret 0400 inside the build, so this is for
+          # the runner's own copy — reveal writes 0644, and any step that
+          # hands the path to ssh directly would be refused.
+          chmod 600 .sc/deploy-keys/go-embedb.pem
 
       - uses: docker/setup-buildx-action@v3
 

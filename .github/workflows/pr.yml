@@ -48,6 +48,11 @@ jobs:
           set -euo pipefail
           sc secrets reveal --force
           test -s .sc/deploy-keys/go-embedb.pem
+          # `sc secrets reveal` writes 0644. ssh refuses a world-readable
+          # private key outright ("bad permissions") and then reports the
+          # fetch as `Permission denied (publickey)`, which reads like the
+          # wrong key rather than the wrong mode.
+          chmod 600 .sc/deploy-keys/go-embedb.pem
 
       - uses: actions/setup-go@v5
         with:
@@ -90,6 +95,11 @@ jobs:
           set -euo pipefail
           sc secrets reveal --force
           test -s .sc/deploy-keys/go-embedb.pem
+          # `sc secrets reveal` writes 0644. ssh refuses a world-readable
+          # private key outright ("bad permissions") and then reports the
+          # fetch as `Permission denied (publickey)`, which reads like the
+          # wrong key rather than the wrong mode.
+          chmod 600 .sc/deploy-keys/go-embedb.pem
 
       - uses: docker/setup-buildx-action@v3
 
