@@ -188,6 +188,13 @@ var componentDefaultsJSON = func() []byte {
 			// (its service demanded BACKUP_S3_BUCKET while the
 			// platform emitted STORAGE_BUCKET, and the dispatch
 			// silently fell back to a broken path).
+			// Where to publish operator-relevant events. Plain env on
+			// purpose: a URL is not a credential, and the matching
+			// NOTIFY_TOKEN travels the SecretsManager-backed
+			// ComponentSecretEnvMap path instead. Empty when the
+			// operator declared no `notify:` block, and the service
+			// treats an empty NOTIFY_URL as "notifications off".
+			"NOTIFY_URL":     "$$sc:${resource:${name}.notify-url}",
 			"STORAGE_BUCKET": "$$sc:${resource:${name}.storage-bucket}",
 			"STORAGE_REGION": "$$sc:${resource:${name}.storage-region}",
 		},
@@ -242,6 +249,11 @@ func (p *observatoryPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaReques
 				"maxMemory", "timeout",
 				// Component-specific top-level keys.
 				"storage", "metadata", "operatorPassword", "readers",
+				// Where to publish operator-relevant events, and the
+				// credential to present. Both must be allowlisted or
+				// SC core's dual-use of this list as
+				// allowed-top-level-keys rejects the whole stack.
+				"notify", "notifyToken",
 				// Which consumer environments may register as tenants.
 				// Empty/absent allows all — the pre-filter behaviour.
 				"tenantEnvironments",
@@ -279,6 +291,20 @@ func (p *observatoryPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaReques
 			observatoryApi.ResourceType: {Entries: map[string]string{
 				"signingKey":       "SERVICE_JWT_SECRET",
 				"operatorPassword": "OBSERVATORY_OPERATOR_PASSWORD",
+				// The publisher's event token: an `op:"event"` JWT the
+				// notifier minted for this tenant. Routed through the
+				// secret-env map rather than ComponentDefaults env so it
+				// lands in a per-function SecretsManager secret instead
+				// of plaintext in the Lambda's environment — the same
+				// transport signingKey already uses.
+				//
+				// The notifier's own signing key is deliberately NOT
+				// handed to publishers: it is also the KEK that seals
+				// every tenant's channel credentials at rest
+				// (DEK = HMAC(signingKey, "secrets:"+tenant)), so a
+				// publisher holding it could decrypt every stored
+				// Telegram token and mint a token for any tenant.
+				"notifyToken": "NOTIFY_TOKEN",
 			}},
 		},
 	}, nil
@@ -312,8 +338,23 @@ func (p *observatoryPlugin) PreProvision(stdctx context.Context, req *scpluginv1
 		raw = map[string]any{}
 	}
 
+	// The `notify:` wiring is resolved here and FAILS THE PROVISION
+	// when it cannot be, rather than deploying with notifications
+	// quietly off. An operator who wrote a `notify:` block believes
+	// they are covered; the first thing they would otherwise learn is
+	// that nobody was paged. Absent `notify:` is not an error — see
+	// observatory.ValidateNotifyWiring.
+	notify, err := observatory.ValidateNotifyWiring(raw)
+	if err != nil {
+		return nil, fmt.Errorf("observatory component %q: %w", resName, err)
+	}
+
 	tpl := map[string]string{
-		"self-url":       observatory.SelfURLFromConfig(raw),
+		"self-url": observatory.SelfURLFromConfig(raw),
+		// Where this component POSTs operator-relevant events. Empty
+		// when no `notify:` block is declared, which the service reads
+		// as "notifications off" — the same contract as an absent env.
+		"notify-url":     notify.URL,
 		"storage-bucket": storageBucket(raw, resName, env),
 		"storage-region": storageRegion(raw),
 		// The credential the deploy template's timer presents on the
@@ -335,8 +376,9 @@ func (p *observatoryPlugin) PreProvision(stdctx context.Context, req *scpluginv1
 		func(_ *sdk.Context, _ api.Stack, _ api.ResourceInput, collector pApi.ComputeContextCollector, _ pApi.ProvisionParams) error {
 			collector.AddResourceTplExtension(resName, tpl)
 			p.progress.Info("pre-provision", fmt.Sprintf(
-				"observatory %q derived: self-url=%q bucket=%q region=%q",
+				"observatory %q derived: self-url=%q bucket=%q region=%q %s",
 				resName, tpl["self-url"], tpl["storage-bucket"], tpl["storage-region"],
+				observatory.NotifyEnvDescription(notify),
 			))
 			return nil
 		},
