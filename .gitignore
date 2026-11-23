@@ -1,0 +1,15 @@
+# SC secret material.
+#
+# Only the ENCRYPTED registry `.sc/secrets.yaml` is committed. The
+# per-operator/CI config (which holds the private key that decrypts it)
+# and every plaintext credential stay local, and in CI are materialised
+# by `sc secrets reveal --force` from the single org-level `SC_CONFIG`.
+#
+# See README.md §Storage for what this repo keeps here (the go-embedb
+# deploy key) and why.
+.sc/cfg.*.yaml
+!.sc/secrets.yaml
+
+# Deploy-key private halves are SC-managed — stored encrypted in
+# .sc/secrets.yaml, revealed into these paths by `sc secrets reveal`.
+.sc/deploy-keys/
