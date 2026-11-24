@@ -69,7 +69,7 @@ func (s *InMemoryStore) List(_ context.Context, prefix string) ([]StoredObject, 
 		if !strings.HasPrefix(k, prefix) {
 			continue
 		}
-		out = append(out, StoredObject{Path: k, Size: int64(len(v.body)), ModifiedAt: v.modifiedAt})
+		out = append(out, StoredObject{Path: k, ModifiedAt: v.modifiedAt})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out, nil

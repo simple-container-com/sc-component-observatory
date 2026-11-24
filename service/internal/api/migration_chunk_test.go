@@ -25,6 +25,7 @@ type chunkResponse struct {
 	DryRun              bool             `json:"dry_run"`
 	Verify              bool             `json:"verify"`
 	S3Count             int              `json:"s3_count"`
+	ExcludedReplication int              `json:"excluded_replication"`
 	Migrated            map[string]int64 `json:"migrated"`
 	Total               int64            `json:"total_migrated"`
 	SinkRows            int64            `json:"sink_rows"`

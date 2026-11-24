@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/simple-container-com/sc-component-observatory/service/internal/storage"
@@ -49,6 +50,18 @@ type MigrationConfig struct {
 	// the safe default: an operator who did not set the env never
 	// opens an unauthenticated migration route).
 	AdminToken string
+
+	// ExcludePrefix is the SINK's own replication prefix inside the
+	// source bucket, and keys under it are not migration input.
+	// Normally storage.DefaultGoEmbedS3Prefix, resolved once at boot
+	// (cmd/observatory: goEmbedS3Prefix) so boot and migration cannot
+	// disagree. Empty means "exclude nothing" — correct for a source
+	// bucket that is not also the replication target, and the right
+	// default for tests that construct a MigrationConfig directly.
+	//
+	// See excludeReplicationKeys for why this is not optional in the
+	// deployed configuration.
+	ExcludePrefix string
 }
 
 // migrationResponse is the shape returned on success.
@@ -63,10 +76,21 @@ type migrationResponse struct {
 	// Verify is true when the call only compared source to sink and
 	// copied nothing. Distinct from DryRun, which walks the copy loop's
 	// control flow without its I/O.
-	Verify   bool             `json:"verify,omitempty"`
-	S3Count  int              `json:"s3_count"`
-	Migrated map[string]int64 `json:"migrated"`
-	Total    int64            `json:"total_migrated"`
+	Verify bool `json:"verify,omitempty"`
+	// S3Count is how many source objects are IN SCOPE — the raw LIST
+	// minus ExcludedReplication. The two together reconstruct what the
+	// bucket actually holds, which matters because the raw number is
+	// the one an operator sees from `aws s3 ls` and it will be larger.
+	S3Count int `json:"s3_count"`
+	// ExcludedReplication is how many listed keys were skipped as the
+	// sink's own replication records. Reported rather than silently
+	// subtracted: a reader comparing s3_count against a bucket count
+	// needs to see where the difference went, and a sudden jump here is
+	// the signal that the sink is writing more than it is being asked
+	// to store. Omitted when zero.
+	ExcludedReplication int              `json:"excluded_replication,omitempty"`
+	Migrated            map[string]int64 `json:"migrated"`
+	Total               int64            `json:"total_migrated"`
 	// SinkRows is the sum over Migrated — the destination's TOTAL row
 	// count, including anything that was there before this run. Exposed
 	// because it is one half of what `verified` compares, and an
@@ -254,16 +278,18 @@ func (c *MigrationConfig) Migrate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, fmt.Sprintf("list source: %v", err))
 		return
 	}
+	objs, excluded := excludeReplicationKeys(objs, c.ExcludePrefix)
 	migrationOrder(objs)
 
 	resp := migrationResponse{
-		DryRun:             dryRun,
-		Verify:             verifyOnly,
-		S3Count:            len(objs),
-		Migrated:           map[string]int64{},
-		SourceByCollection: map[string]int64{},
-		Limit:              limit,
-		After:              after,
+		DryRun:              dryRun,
+		Verify:              verifyOnly,
+		S3Count:             len(objs),
+		Migrated:            map[string]int64{},
+		SourceByCollection:  map[string]int64{},
+		Limit:               limit,
+		After:               after,
+		ExcludedReplication: excluded,
 	}
 	for _, o := range objs {
 		resp.SourceByCollection[storage.CollectionNameFor(o.Path)]++
@@ -462,6 +488,70 @@ var migrationRank = map[string]int{
 	storage.CollectionDeploys:       2,
 	storage.CollectionKV:            3,
 	storage.CollectionHealth:        4,
+}
+
+// excludeReplicationKeys drops the keys the SINK wrote, and returns how
+// many it dropped. An empty prefix is a no-op.
+//
+// ## Why this exists: the migration was reading the sink's write-ahead
+// log as if it were pending work
+//
+// Live-caught 2026-11-24, during the observatory wet run, within twenty
+// minutes of the USE_GOEMBEDB=1 flip. Three individually safe decisions
+// composed into one:
+//
+//  1. GOEMBEDB_S3_BUCKET deliberately points at the bucket the
+//     component ALREADY owns — the same bucket this migration reads
+//     from — so that the cutover creates no new paid resource and needs
+//     no new IAM grant. Frugal, and the right call.
+//  2. storage.CollectionNameFor routes any path outside the `_meta/`
+//     tree to the catch-all `kv` collection, so a future writer using
+//     an unforeseen key shape is still served. Defensive, and correct.
+//  3. The source enumeration is Source.List(ctx, "") — the WHOLE
+//     bucket, because a migration that silently skipped a prefix would
+//     be the worse failure. Complete, and deliberate.
+//
+// Together: every row go-embedb accepted replicated back into the same
+// bucket under its own prefix; that prefix matches no `_meta/` class,
+// so it classified as `kv`; and the unfiltered LIST handed it back as
+// migration input. Measured: `kv` went from 3 source keys at dry-run to
+// **9166** eighteen minutes later, against ~9127 rows written — a 1:1
+// echo of the migration's own output. `s3_count` went 9102 -> 18265.
+//
+// Two consequences, and the second is the one that cost time:
+//
+//   - The run copied 25 replication records INTO the kv collection,
+//     each of which generated another replication record. Bounded per
+//     call by the chunk cursor, but every call grew the source.
+//   - `verified` became a false negative that could never go true.
+//     `missing_by_collection: {kv: 9138}` is not a shortfall, it is
+//     out-of-scope data counted as scope — and it is unfixable by
+//     copying harder, because copying is what produces it.
+//
+// The per-class verify hardened earlier that same day did its job and
+// still reported failure, because the question it answers ("is the sink
+// sufficient for every class the source carries?") is sound only if the
+// source set is sound. A correct formula over a contaminated input set
+// returns a confident wrong answer.
+//
+// Note what did NOT catch this. The server.yaml comment reasoned the
+// prefix "cannot collide with the S3Store's own `_meta/` records in the
+// same bucket" — true, and true only for READS. The enumeration is not
+// a read of a known key; it is a question about the whole bucket, and a
+// prefix that collides with nothing still answers it.
+func excludeReplicationKeys(objs []storage.StoredObject, prefix string) (kept []storage.StoredObject, excluded int) {
+	if prefix == "" {
+		return objs, 0
+	}
+	kept = make([]storage.StoredObject, 0, len(objs))
+	for _, o := range objs {
+		if strings.HasPrefix(o.Path, prefix) {
+			excluded++
+			continue
+		}
+		kept = append(kept, o)
+	}
+	return kept, excluded
 }
 
 // migrationOrder sorts objs in place into the copy order described on

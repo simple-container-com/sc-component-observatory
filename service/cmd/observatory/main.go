@@ -250,9 +250,14 @@ func run() error {
 	// case the endpoint returns a 500 that names what is missing.
 	if migrationToken != "" {
 		migration := &api.MigrationConfig{
-			Source:     migrationSource,
-			Sink:       migrationSink,
-			AdminToken: migrationToken,
+			Source: migrationSource,
+			Sink:   migrationSink,
+			// The sink replicates into the SAME bucket the source
+			// reads, so its own records would otherwise be enumerated
+			// as pending work. Resolved through the same helper the
+			// boot path uses, so the two cannot drift.
+			ExcludePrefix: goEmbedS3Prefix(),
+			AdminToken:    migrationToken,
 		}
 		mux.HandleFunc("POST /admin/migrate-s3-to-goembedb", migration.Migrate)
 	}
