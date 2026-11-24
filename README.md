@@ -200,10 +200,12 @@ service serves an empty store while S3 still holds everything.
          USE_GOEMBEDB: "1"
          GOEMBEDB_S3_BUCKET: "<replication-bucket>"
    ```
-   `GOEMBEDB_S3_BUCKET` is **not optional on Lambda**: without it the embed logs
-   a warning, falls back to `GOEMBEDB_SQLITE_DIR` (`/tmp/goembedb`) and runs
-   single-node — which on Lambda means the dataset dies with every container
-   recycle. The execution role needs read/write on that bucket prefix.
+   `GOEMBEDB_S3_BUCKET` is **hard-required on Lambda**: the service refuses to
+   boot with `GOEMBEDB_S3_BUCKET is required on Lambda …`. Without a shared
+   bucket, each warm container runs its own `/tmp`-backed store, up/down edge
+   state resets across cold starts, and the alerting fires spurious edges —
+   the exact shape this component exists to detect. The execution role needs
+   read/write on that bucket prefix.
 
    `migrationToken` is bound through the component's secret-env wire, so it lands
    in a per-function SecretsManager entry and the service resolves the ARN at
@@ -252,7 +254,7 @@ Prometheus text at `GET /metrics`, unauthenticated.
 | Env | Effect | Required when |
 |---|---|---|
 | `USE_GOEMBEDB` | `1` → MongoStore, anything else → S3Store. | Opt-in; default is S3. |
-| `GOEMBEDB_S3_BUCKET` | Shared replication bucket (e.g. `backup-archives--staging`). | `USE_GOEMBEDB=1`. **Effectively mandatory on Lambda** — unset only warns and falls back to single-node on `/tmp`, which dies with every container recycle. |
+| `GOEMBEDB_S3_BUCKET` | Shared replication bucket (e.g. `backup-archives--staging`). | `USE_GOEMBEDB=1`. **Hard-required on Lambda** — unset refuses to boot with `GOEMBEDB_S3_BUCKET is required on Lambda …`. On ECS / VM / local smoke it is optional (fall back to single-node sqlite). |
 | `GOEMBEDB_S3_PREFIX` | Key namespace in the bucket. | Optional. Default `sc-component-observatory/`. |
 | `GOEMBEDB_S3_REGION` | AWS region for the bucket. | Optional; falls back to `AWS_REGION`. |
 | `GOEMBEDB_REPLSET_NAME` | Replica-set label. | Optional. Default `observatory`. |
