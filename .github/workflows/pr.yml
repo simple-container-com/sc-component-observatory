@@ -113,6 +113,70 @@ jobs:
           go test ./... -count=1
           git diff --exit-code go.mod go.sum
 
+  # Asserts the tests actually catch the faults they claim to. See
+  # hack/mutation-check.py — it breaks one guard at a time and requires
+  # the matching test to go red. This is what distinguishes a regression
+  # test from a test that merely agrees with the code as written: the
+  # TWO version-wire entries pin the exact shape that has cost this
+  # fleet twice already (a secret bound but read as raw env by the
+  # service, logging identically to a working deploy).
+  mutation-check:
+    name: mutation check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # service/go.mod routes github.com/FerretDB/FerretDB to the PRIVATE
+      # go-embedb fork, so the service module needs the deploy-key reveal
+      # for `go mod download` to resolve. The harness runs tests in both
+      # modules; plugin/ has no private dep, but the service half does
+      # and this one credential path covers both runs.
+      - uses: simple-container-com/actions/install-sc@main
+      - name: Reveal the go-embedb deploy key
+        env:
+          SIMPLE_CONTAINER_CONFIG: ${{ secrets.SC_CONFIG }}
+        run: |
+          set -euo pipefail
+          sc secrets reveal --force
+          test -s .sc/deploy-keys/go-embedb.pem
+          chmod 600 .sc/deploy-keys/go-embedb.pem
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: service/go.mod
+          cache-dependency-path: service/go.sum
+
+      # Warm the build cache once per module, so the one `go test -run`
+      # call per mutation doesn't each pay for a cold compile. Both
+      # modules: the harness mutates service/ and plugin/.
+      #
+      # Non-fatal on purpose: this step only warms a cache, and the
+      # mutation loop re-fetches whatever is missing. Gating the job on
+      # it turns a module-proxy hiccup into a red PR — which is what
+      # notifier hit the first time it ran (proxy.golang.org answered
+      # INTERNAL_ERROR mid-zip).
+      - name: prime build cache
+        continue-on-error: true
+        env:
+          GOPRIVATE: github.com/simple-container-com/*
+          GIT_SSH_COMMAND: ssh -i ${{ github.workspace }}/.sc/deploy-keys/go-embedb.pem -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
+        run: |
+          set -euo pipefail
+          git config --global url."git@github.com:".insteadOf "https://github.com/"
+          (cd service && go test ./... -count=1 -run XXXNONE)
+          (cd plugin  && go test ./... -count=1 -run XXXNONE)
+
+      - name: mutation check
+        env:
+          GOPRIVATE: github.com/simple-container-com/*
+          GIT_SSH_COMMAND: ssh -i ${{ github.workspace }}/.sc/deploy-keys/go-embedb.pem -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
+        run: python3 hack/mutation-check.py
+
+      # A mutation that is written back incorrectly would leave the tree
+      # dirty. Cheap insurance against the harness itself lying.
+      - name: tree restored
+        run: git diff --exit-code
+
   image:
     name: Build the service image (no push)
     runs-on: ubuntu-latest
