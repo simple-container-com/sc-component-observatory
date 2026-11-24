@@ -55,9 +55,22 @@ type notFoundError struct{}
 func (*notFoundError) Error() string { return "storage: object not found" }
 
 // StoredObject is a listing result.
+//
+// There is deliberately no Size. It was here, set by all three
+// backends and read by none of them — and on MongoStore computing it
+// meant projecting the document body into every List, which cost the
+// dashboard ~10 s per request (see listProjection in goembedb.go).
+//
+// Removed rather than fixed, because the two ways to keep it are both
+// worse. Returning 0 on MongoStore and a real byte count on S3/FS is a
+// silent per-backend divergence: every caller type-checks and the wrong
+// one answers 0. Keeping it honest means either paying the payload
+// transfer forever or carrying a stored `size` field that has to be
+// backfilled and kept in step with every Put. A field with no reader
+// earns neither. If a caller ever genuinely needs a size, add it back
+// as a stored field written at Put time, and note here why.
 type StoredObject struct {
 	Path       string
-	Size       int64
 	ModifiedAt time.Time
 }
 
@@ -247,9 +260,6 @@ func listAllObjects(ctx context.Context, api s3ListAPI, bucket, prefix string) (
 		}
 		for _, o := range out.Contents {
 			so := StoredObject{Path: aws.ToString(o.Key)}
-			if o.Size != nil {
-				so.Size = *o.Size
-			}
 			if o.LastModified != nil {
 				so.ModifiedAt = *o.LastModified
 			}

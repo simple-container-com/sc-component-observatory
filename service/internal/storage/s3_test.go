@@ -106,11 +106,15 @@ func TestS3Store_List_PaginatesPastPageCap(t *testing.T) {
 	if got[total-1].Path != "health/01000.json" {
 		t.Errorf("last key = %q, want health/01000.json", got[total-1].Path)
 	}
-	if got[total-1].Size != total-1 {
-		t.Errorf("last size = %d, want %d", got[total-1].Size, total-1)
-	}
-	if got[total-1].ModifiedAt.IsZero() {
-		t.Error("last ModifiedAt is zero; LastModified was not copied")
+	// The per-object metadata came from the right object, not just from
+	// some object. The fixture stamps LastModified at base+i seconds, so
+	// an exact compare here distinguishes "page 2 was stitched on" from
+	// "page 2's keys were stitched onto page 1's metadata". This used to
+	// assert on StoredObject.Size, which no longer exists — see the
+	// comment on StoredObject.
+	wantMod := time.Date(2026, 11, 24, 0, 0, 0, 0, time.UTC).Add(time.Duration(total-1) * time.Second)
+	if !got[total-1].ModifiedAt.Equal(wantMod) {
+		t.Errorf("last ModifiedAt = %s, want %s", got[total-1].ModifiedAt, wantMod)
 	}
 
 	// Two calls, and the second one must carry the token the FIRST

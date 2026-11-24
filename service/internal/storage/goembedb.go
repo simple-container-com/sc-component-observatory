@@ -174,8 +174,9 @@ func (s *MongoStore) Get(ctx context.Context, path string) (io.ReadCloser, error
 // regex is fast enough and the semantics match S3's prefix listing
 // byte-for-byte.
 //
-// Projection omits the body: a listing is for counts and modified
-// times; no caller reads the bytes back out of the listing.
+// The projection omits the body — see listProjection. That is not an
+// optimisation, it is the difference between this backend being usable
+// and not: see the 10.4 s measurement in that comment.
 func (s *MongoStore) List(ctx context.Context, prefix string) ([]StoredObject, error) {
 	prefix = strings.TrimPrefix(prefix, "/")
 	coll := s.collectionFor(prefix)
@@ -183,7 +184,7 @@ func (s *MongoStore) List(ctx context.Context, prefix string) ([]StoredObject, e
 	if prefix != "" {
 		filter = bson.M{"_id": bson.M{"$regex": "^" + regexp.QuoteMeta(prefix)}}
 	}
-	opts := options.Find().SetProjection(bson.M{"_id": 1, "body": 1, "updatedAt": 1})
+	opts := options.Find().SetProjection(listProjection())
 	cur, err := coll.Find(ctx, filter, opts)
 	if err != nil {
 		return nil, fmt.Errorf("storage.MongoStore.List %q: %w", prefix, err)
@@ -197,7 +198,6 @@ func (s *MongoStore) List(ctx context.Context, prefix string) ([]StoredObject, e
 		}
 		out = append(out, StoredObject{
 			Path:       doc.ID,
-			Size:       int64(len(doc.Body.Data)),
 			ModifiedAt: doc.UpdatedAt,
 		})
 	}
@@ -205,6 +205,35 @@ func (s *MongoStore) List(ctx context.Context, prefix string) ([]StoredObject, e
 		return nil, fmt.Errorf("storage.MongoStore.List %q: cursor: %w", prefix, err)
 	}
 	return out, nil
+}
+
+// listProjection is the field set List asks for, factored out so a test
+// can assert what is NOT in it.
+//
+// `body` MUST NOT be here. A listing is keys and modified times; the
+// bytes are fetched by Get, one key at a time, by the caller that
+// actually wants them. Including `body` makes every List transfer the
+// full payload of every matching document and then throw it away.
+//
+// This is not a micro-optimisation, and the cost is not proportional to
+// anything a reader would expect. Live-measured 2026-11-24, immediately
+// after the USE_GOEMBEDB=1 cutover: `GET /api/v1/services` took
+// **10.4-11.4 s to return 8 rows** — indistinguishable from the S3
+// baseline it was meant to improve on. The handler calls LatestHealth
+// per service, which lists that service's whole health prefix (~1112
+// keys per stack) to sort-and-take 50. With `body` in the projection
+// that is ~8900 full health documents pulled over the loopback and
+// BSON-decoded per request, to compute a field (the long-deleted
+// StoredObject.Size) that no caller ever read.
+//
+// The reason it was invisible in review is worth keeping: on S3,
+// ListObjectsV2 is **metadata-only** and cannot carry payloads, so the
+// same code shape costs nothing there. Moving to a document store
+// changed what a "list" means, and the body tagged along. The doc
+// comment on List had claimed the body was omitted since the file was
+// written; it was the code that was wrong, not the comment.
+func listProjection() bson.M {
+	return bson.M{"_id": 1, "updatedAt": 1}
 }
 
 // Delete removes one key. Missing → ErrNotFound, matching S3Store /
@@ -239,6 +268,30 @@ var Collections = []string{
 	CollectionHealth,
 	CollectionKV,
 }
+
+// DefaultGoEmbedS3Prefix is the key prefix go-embedb's active-active
+// replication writes its own records under, inside GOEMBEDB_S3_BUCKET.
+// Overridable by GOEMBEDB_S3_PREFIX; the default lives here rather than
+// at the boot site because TWO callers need to agree on it, and they
+// are in different packages:
+//
+//  1. the boot path, which hands it to ferretdb as the replication
+//     prefix (cmd/observatory/boot_goembedb.go);
+//  2. the migration endpoint, which must EXCLUDE it from the source
+//     listing (internal/api/migration.go).
+//
+// They have to agree because the fleet deliberately points
+// GOEMBEDB_S3_BUCKET at the bucket the component already owns — the
+// same bucket the S3Store it is replacing reads and writes (see
+// server.yaml's `GOEMBEDB_S3_BUCKET: sc-observatory-data--staging`,
+// chosen so the cutover creates no new paid resource and needs no new
+// IAM grant). That is safe for reads, because this prefix cannot
+// collide with the `_meta/` tree. It is NOT safe for a migration that
+// enumerates the whole bucket: see excludeReplicationKeys.
+//
+// If these two drift, the symptom is not an error. It is a migration
+// that never reports verified.
+const DefaultGoEmbedS3Prefix = "sc-component-observatory/"
 
 // Collection names. Lower-case, underscore-separated — the Mongo
 // convention and the one go-embedb's own metadata uses.

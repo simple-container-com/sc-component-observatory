@@ -209,7 +209,6 @@ func (s *FSStore) List(_ context.Context, prefix string) ([]StoredObject, error)
 		rel, _ := filepath.Rel(s.root, child)
 		out = append(out, StoredObject{
 			Path:       filepath.ToSlash(rel),
-			Size:       info.Size(),
 			ModifiedAt: info.ModTime(),
 		})
 	}
@@ -239,7 +238,6 @@ func (s *FSStore) listDir(dir string) ([]StoredObject, error) {
 		rel, _ := filepath.Rel(s.root, path)
 		out = append(out, StoredObject{
 			Path:       filepath.ToSlash(rel),
-			Size:       info.Size(),
 			ModifiedAt: info.ModTime(),
 		})
 		return nil
