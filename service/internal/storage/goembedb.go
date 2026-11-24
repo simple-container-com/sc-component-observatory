@@ -269,6 +269,18 @@ func (s *MongoStore) collectionFor(path string) *mongo.Collection {
 	return s.client.Database(s.dbName).Collection(collectionNameFor(path))
 }
 
+// CollectionNameFor is the exported form of the path→collection router,
+// for callers outside this package that need to know which collection a
+// SOURCE key would land in without having a MongoStore to hand.
+//
+// The migration endpoint uses it to bucket an S3 listing by destination
+// collection, so a partial migration is legible per class instead of
+// hiding inside a single sum. That distinction is load-bearing: keys
+// migrate in sorted path order, which puts `services` — the collection
+// the dashboard renders — behind every `health` tick, so a copy that
+// stops early produces a full-looking row count and an empty dashboard.
+func CollectionNameFor(path string) string { return collectionNameFor(path) }
+
 func collectionNameFor(path string) string {
 	// Fast-path the exact substrings. order matters only in that
 	// "deploy-configs/" is checked before "deploys/" — the two classes

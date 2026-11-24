@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/simple-container-com/sc-component-observatory/service/internal/storage"
@@ -55,11 +56,14 @@ type MigrationConfig struct {
 // `Migrated` is the per-collection count the destination's documents
 // landed under (so an operator can diff against each class's expected
 // row count). `S3Count` is how many source objects the LIST walked.
-// `Verified` is deliberately conservative — see the comment at the
-// assignment for the three ways the obvious version of it reported
-// success on a bad migration.
+// `Verified` is deliberately conservative — see verifyAgainstSource and
+// the comment at the assignment.
 type migrationResponse struct {
-	DryRun   bool             `json:"dry_run"`
+	DryRun bool `json:"dry_run"`
+	// Verify is true when the call only compared source to sink and
+	// copied nothing. Distinct from DryRun, which walks the copy loop's
+	// control flow without its I/O.
+	Verify   bool             `json:"verify,omitempty"`
 	S3Count  int              `json:"s3_count"`
 	Migrated map[string]int64 `json:"migrated"`
 	Total    int64            `json:"total_migrated"`
@@ -68,10 +72,74 @@ type migrationResponse struct {
 	// because it is one half of what `verified` compares, and an
 	// operator reading a bare `verified: true` cannot otherwise see
 	// whether the sink was empty beforehand.
-	SinkRows  int64            `json:"sink_rows"`
+	SinkRows int64 `json:"sink_rows"`
+
+	// SourceByCollection buckets the SOURCE listing by the collection
+	// each key would land in. The per-class counterpart to Migrated, and
+	// the only reading that distinguishes "9105 rows arrived" from "the
+	// 9105 rows that arrived are the ones the dashboard needs".
+	SourceByCollection map[string]int64 `json:"source_by_collection,omitempty"`
+	// MissingByCollection holds, per collection, how many rows the sink
+	// is short of what the source listed. Omitted when empty — an empty
+	// map IS the success case, and a reader should not have to tell
+	// "nothing missing" from "never computed".
+	MissingByCollection map[string]int64 `json:"missing_by_collection,omitempty"`
+
+	// Limit and After echo the chunking inputs, so a response pasted
+	// into a handoff carries the request that produced it.
+	Limit int    `json:"limit,omitempty"`
+	After string `json:"after,omitempty"`
+	// NextAfter is the last key this call PROCESSED — feed it back as
+	// `after` to continue. Empty when the call copied nothing.
+	NextAfter string `json:"next_after,omitempty"`
+	// Done is true when this call reached the end of the listing, i.e.
+	// no key remains after NextAfter. The operator's loop condition.
+	Done bool `json:"done"`
+	// Remaining is how many listed keys this call did not reach.
+	Remaining int `json:"remaining"`
+	// CopyMs is the copy loop alone, excluding the LIST and the sink
+	// count. This is the number that sizes the next chunk; ElapsedMs
+	// includes fixed per-call overhead and would over-estimate.
+	CopyMs int64 `json:"copy_ms"`
+
 	ElapsedMs int64            `json:"elapsed_ms"`
 	Verified  bool             `json:"verified"`
 	Errors    []migrationError `json:"errors,omitempty"`
+}
+
+// verifyAgainstSource compares a source listing, bucketed by destination
+// collection, against the sink's actual per-collection row counts.
+//
+// Returns the per-collection shortfall (only non-zero entries) and
+// whether the sink is sufficient for every class the source carries.
+//
+// This is a stronger check than comparing the two totals, and the
+// difference is the exact failure this migration is exposed to. A
+// partial copy is not a uniform sample of the source: it is a prefix of
+// whatever order the loop walks, so which CLASS is missing is decided
+// entirely by that order. Under plain sorted-path order —
+// `deploy_configs` < `deploys` < `health` < `kv` < `services` — the
+// bulkiest class (`health`, continuously written ticks) copies in the
+// middle and `services`, the one the dashboard renders, copies LAST. A
+// copy that died most of the way through would produce a sink whose
+// total row count looked nearly complete with the dashboard empty, and
+// an aggregate comparison reports that as a near-miss rather than the
+// total failure it is. migrationOrder below fixes the order; this
+// function is what makes the result legible either way.
+//
+// What this does NOT establish: that the rows in the sink got there
+// from this migration. It compares a listing to a row count, so a sink
+// that was already populated satisfies it trivially. Causation comes
+// only from knowing the sink was empty beforehand, which is why the
+// dry-run reports `sink_rows` and why the runbook says to read it first.
+func verifyAgainstSource(sourceByCollection, sinkCounts map[string]int64) (missing map[string]int64, ok bool) {
+	missing = map[string]int64{}
+	for coll, want := range sourceByCollection {
+		if got := sinkCounts[coll]; got < want {
+			missing[coll] = want - got
+		}
+	}
+	return missing, len(missing) == 0
 }
 
 type migrationError struct {
@@ -87,17 +155,42 @@ type migrationError struct {
 //     in S3. The colocated store namespaces everything under `_meta/`,
 //     so even a bucket shared with other sc-components (prefix
 //     routing) walks only the registry's own tree.
-//  2. For each key: Source.Get then Sink.Put. Idempotent — ReplaceOne
-//     with upsert means a retried migration overwrites, not
-//     duplicates.
-//  3. CollectionCounts on the sink produces the per-class row count
-//     the operator diffs against expectations, and `sink_rows` their
-//     sum. `verified` requires a non-empty source, zero per-key
-//     errors, every listed key written, and the sink holding at least
-//     that many rows.
+//  2. For each key in the current chunk: Source.Get then Sink.Put.
+//     Idempotent — ReplaceOne with upsert means a retried migration
+//     overwrites, not duplicates.
+//  3. CollectionCounts on the sink produces the per-class row count,
+//     compared against the source listing bucketed the same way (see
+//     verifyAgainstSource).
 //
-// Query parameter `dry_run=1` lists but does not write. Lets the
-// operator validate scope and count before touching Mongo.
+// Query parameters:
+//
+//	dry_run=1     list and bucket, write nothing. Validates scope and
+//	              count, and reports the sink's PRE-migration row
+//	              counts — the only reading that later establishes the
+//	              migration is what populated it.
+//	verify=1      compare source listing to sink counts, copy nothing.
+//	              The pass that closes out a chunked migration.
+//	limit=<n>     copy at most n keys this call. 0/absent = all of them.
+//	after=<key>   skip keys <= this one. Feed back `next_after`.
+//
+// ## Why chunking exists
+//
+// The copy is serial — one GetObject plus one sink Put per key — and
+// this service is a Lambda with a 30-second timeout behind a Cloudflare
+// edge that gives up around 100 seconds. Neither bound is reachable
+// from inside the handler, and the response is a single buffered write
+// after the loop, so a run that outlives either one returns nothing at
+// all: no count, no error list, no cursor. Worse, `verified` requires
+// Total == S3Count against THIS call's copies, so re-invoking an
+// unbounded migration restarts at the first key and makes no forward
+// progress. A bucket that takes longer than the timeout can therefore
+// never be migrated by retrying, only by chunking.
+//
+// Picking the chunk size is the operator's, from measurement: run one
+// small `limit` and read `copy_ms`. The per-key cost is not derivable
+// from any pre-cutover measurement — those were all taken against the
+// S3 read path, and the sink here is go-embedb with S3 replication,
+// which nothing pre-cutover touched.
 //
 // A per-key error is NON-fatal: the migration continues past it and
 // the response lists every failure. Live-caught lesson from an
@@ -127,7 +220,32 @@ func (c *MigrationConfig) Migrate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dryRun := r.URL.Query().Get("dry_run") == "1"
+	q := r.URL.Query()
+	dryRun := q.Get("dry_run") == "1"
+	verifyOnly := q.Get("verify") == "1"
+	if dryRun && verifyOnly {
+		writeErr(w, http.StatusBadRequest, "dry_run and verify are mutually exclusive: dry_run walks the copy loop without I/O, verify skips the loop entirely")
+		return
+	}
+	// A malformed limit is refused rather than defaulted, because
+	// `limit = 0` means UNBOUNDED here — so falling through on a parse
+	// error does not degrade to a conservative chunk, it runs the whole
+	// bucket. TestMigration_BadParams was mutated to confirm that: with
+	// the guard disabled, `limit=abc` copied every fixture instead of
+	// returning 400. On the real bucket (9105 objects) that is the
+	// unbounded, un-resumable run that outlives the Lambda timeout and
+	// returns nothing — exactly what chunking exists to avoid, reached
+	// by a typo.
+	limit := 0
+	if raw := q.Get("limit"); raw != "" {
+		n, perr := strconv.Atoi(raw)
+		if perr != nil || n < 0 {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("limit must be a non-negative integer, got %q", raw))
+			return
+		}
+		limit = n
+	}
+	after := q.Get("after")
 	start := time.Now()
 
 	ctx := r.Context()
@@ -136,36 +254,91 @@ func (c *MigrationConfig) Migrate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, fmt.Sprintf("list source: %v", err))
 		return
 	}
-	// Stable iteration so a diff of two runs is meaningful.
-	sort.Slice(objs, func(i, j int) bool { return objs[i].Path < objs[j].Path })
+	migrationOrder(objs)
 
 	resp := migrationResponse{
-		DryRun:   dryRun,
-		S3Count:  len(objs),
-		Migrated: map[string]int64{},
+		DryRun:             dryRun,
+		Verify:             verifyOnly,
+		S3Count:            len(objs),
+		Migrated:           map[string]int64{},
+		SourceByCollection: map[string]int64{},
+		Limit:              limit,
+		After:              after,
+	}
+	for _, o := range objs {
+		resp.SourceByCollection[storage.CollectionNameFor(o.Path)]++
 	}
 
-	for _, o := range objs {
-		if dryRun {
+	// Resolve the cursor to an index in THIS call's ordering. Index, not
+	// a lexical `>` comparison, because migrationOrder is not lexical —
+	// a string compare against `after` would silently restart inside a
+	// different class.
+	//
+	// A cursor that is no longer in the listing is a 409, not a silent
+	// restart from zero: the source changed under the operator (the
+	// health prune sweep deletes keys), and resuming from the top would
+	// re-copy everything already done while reporting a `total_migrated`
+	// that double-counts. Loud is cheap here — `verify=1` tells them
+	// where they actually stand.
+	startIdx := 0
+	if after != "" {
+		idx := -1
+		for i, o := range objs {
+			if o.Path == after {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			writeErr(w, http.StatusConflict, fmt.Sprintf("cursor %q is not in the current source listing — it was deleted or the source changed; run with verify=1 to see what the sink is missing, then resume from a key that still exists or re-run without `after`", after))
+			return
+		}
+		startIdx = idx + 1
+	}
+
+	pending := objs[startIdx:]
+	if verifyOnly {
+		// Nothing is copied, so there is no cursor to advance and
+		// nothing is pending. Done reflects the comparison having
+		// covered the whole listing, which it always does.
+		resp.Done = true
+	} else {
+		chunk := pending
+		if limit > 0 && limit < len(chunk) {
+			chunk = chunk[:limit]
+		}
+		copyStart := time.Now()
+		for _, o := range chunk {
+			// NextAfter advances on every key the loop REACHES,
+			// including one that errored. A failed key that blocked the
+			// cursor would make the operator's loop spin on it forever;
+			// the failure is in `errors` and the shortfall is in
+			// `missing_by_collection`, so it cannot be lost by moving on.
+			resp.NextAfter = o.Path
+			if dryRun {
+				resp.Total++
+				continue
+			}
+			rc, gerr := c.Source.Get(ctx, o.Path)
+			if gerr != nil {
+				resp.Errors = append(resp.Errors, migrationError{Path: o.Path, Err: "get: " + gerr.Error()})
+				continue
+			}
+			body, rerr := io.ReadAll(rc)
+			_ = rc.Close()
+			if rerr != nil {
+				resp.Errors = append(resp.Errors, migrationError{Path: o.Path, Err: "read: " + rerr.Error()})
+				continue
+			}
+			if _, perr := c.Sink.Put(ctx, o.Path, bytes.NewReader(body)); perr != nil {
+				resp.Errors = append(resp.Errors, migrationError{Path: o.Path, Err: "put: " + perr.Error()})
+				continue
+			}
 			resp.Total++
-			continue
 		}
-		rc, gerr := c.Source.Get(ctx, o.Path)
-		if gerr != nil {
-			resp.Errors = append(resp.Errors, migrationError{Path: o.Path, Err: "get: " + gerr.Error()})
-			continue
-		}
-		body, rerr := io.ReadAll(rc)
-		_ = rc.Close()
-		if rerr != nil {
-			resp.Errors = append(resp.Errors, migrationError{Path: o.Path, Err: "read: " + rerr.Error()})
-			continue
-		}
-		if _, perr := c.Sink.Put(ctx, o.Path, bytes.NewReader(body)); perr != nil {
-			resp.Errors = append(resp.Errors, migrationError{Path: o.Path, Err: "put: " + perr.Error()})
-			continue
-		}
-		resp.Total++
+		resp.CopyMs = time.Since(copyStart).Milliseconds()
+		resp.Remaining = len(pending) - len(chunk)
+		resp.Done = resp.Remaining == 0
 	}
 
 	// Count destination rows even on a dry-run — gives the operator a
@@ -181,9 +354,14 @@ func (c *MigrationConfig) Migrate(w http.ResponseWriter, r *http.Request) {
 		resp.SinkRows += n
 	}
 
-	// Verified: zero per-key errors, every listed key actually written,
-	// a non-empty source, AND the sink holding at least as many rows as
-	// the source listed.
+	missing, sinkSufficient := verifyAgainstSource(resp.SourceByCollection, resp.Migrated)
+	if len(missing) > 0 {
+		resp.MissingByCollection = missing
+	}
+
+	// Verified: a non-empty source, no errors in this call, the whole
+	// listing covered, and EVERY class in the sink at least as populated
+	// as the source listed for it.
 	//
 	// Each clause is here because the obvious one-liner this replaced
 	// (`sum >= S3Count`) was computable as TRUE in three ways that had
@@ -195,23 +373,32 @@ func (c *MigrationConfig) Migrate(w http.ResponseWriter, r *http.Request) {
 	//     success. Hence `S3Count > 0`.
 	//   - **Truncated source.** 1000 copied >= 1000 listed, when the
 	//     bucket held more. That was real: an unpaginated
-	//     `S3Store.List` clipped at the ListObjectsV2 page cap, and
-	//     because keys migrate in sorted path order the clip would have
-	//     copied `health/` ticks and never reached `services/`. Fixed
-	//     in storage/s3.go; `S3Count > 0` cannot catch it, so the fix
-	//     is the lister's and the warn below is the tripwire.
+	//     `S3Store.List` clipped at the ListObjectsV2 page cap. The real
+	//     count turned out to be 9105, so the clip was dropping ~89% —
+	//     and under the old sorted-path order it would have copied
+	//     `health/` ticks and never reached `services/`. Fixed in
+	//     storage/s3.go; `S3Count > 0` cannot catch it, so the fix is
+	//     the lister's and the warn below is the tripwire.
 	//   - **A sink that was already populated.** `sum` is the
-	//     DESTINATION's whole row count, not a tally of this run's
-	//     work, so a sink carrying live traffic satisfies
-	//     `sum >= S3Count` even if zero objects copied. Hence
-	//     `resp.Total == S3Count`, which counts successful Puts.
+	//     DESTINATION's whole row count, not a tally of this run's work,
+	//     so a sink carrying live traffic satisfies `sum >= S3Count`
+	//     even if zero objects copied. The per-class comparison has the
+	//     same blind spot by construction — it compares a listing to row
+	//     counts — which is why `sink_rows` is reported on the dry-run:
+	//     the PRE-migration reading is the only thing that establishes
+	//     this migration is what populated the sink.
 	//
-	// `Total == S3Count` is implied by `len(Errors) == 0` on today's
-	// loop; it is stated anyway so a future path that counts
-	// differently cannot quietly re-open the hole. A dry run never
-	// claims verified.
-	if !dryRun && len(resp.Errors) == 0 && resp.S3Count > 0 {
-		resp.Verified = resp.Total == int64(resp.S3Count) && resp.SinkRows >= int64(resp.Total)
+	// Deliberately NOT in the formula: `Total == S3Count`. Under
+	// chunking it is false on every chunk but the whole-bucket one, so
+	// requiring it would mean a chunked migration could never report
+	// verified even once complete. `sinkSufficient` is the stronger
+	// statement anyway — it is about the store's contents rather than
+	// one call's tally, and it is the one an operator actually wants
+	// before dropping the migration token. A dry run never claims
+	// verified; `verify=1` is exactly how you ask this question without
+	// copying.
+	if !dryRun && resp.S3Count > 0 && len(resp.Errors) == 0 && resp.Done && sinkSufficient {
+		resp.Verified = true
 	}
 	resp.ElapsedMs = time.Since(start).Milliseconds()
 
@@ -236,6 +423,70 @@ func (c *MigrationConfig) Migrate(w http.ResponseWriter, r *http.Request) {
 		"elapsed_ms", resp.ElapsedMs)
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// migrationRank orders the destination collections by how much a
+// partial migration hurts if that class is the one left behind.
+//
+// Lower copies first. This is NOT arbitrary and it is NOT alphabetical,
+// which is the whole point:
+//
+//	services       the dashboard's primary index. Empty ⇒ the UI has
+//	               nothing to render at all, and it is the smallest
+//	               class, so it costs nothing to front-load.
+//	deploy_configs small, and what the config-diff view reads.
+//	deploys        the timeline. Degrades gracefully — a short timeline
+//	               looks like a young service.
+//	kv             miscellany; nothing renders it directly.
+//	health         bulkiest by a wide margin (one object per tick per
+//	               stack) and the most self-healing: the scheduler
+//	               writes new ticks continuously, so a gap backfills
+//	               itself with time. Last by both measures.
+//
+// Why it matters: a partial copy is a PREFIX of the walk order, so the
+// order decides which class survives a bound being hit. Plain sorted
+// order puts `services` last and `health` in the middle — exactly
+// inverted. Under it, a copy clipped at 1000 of 9105 keys would have
+// migrated nothing but health ticks and reported a plausible-looking
+// row count over an empty dashboard.
+//
+// The sibling sc-component-backup has the same hazard with a different
+// cast: its five walked prefixes are alphabetical and `tenants/` sorts
+// LAST, while its scheduler treats a tenant with no row as never backed
+// up — so a clipped copy there does not merely look empty, it can
+// re-fire backups. Any component adding a migration of this shape
+// should pick the order deliberately rather than inherit the sort.
+var migrationRank = map[string]int{
+	storage.CollectionServices:      0,
+	storage.CollectionDeployConfigs: 1,
+	storage.CollectionDeploys:       2,
+	storage.CollectionKV:            3,
+	storage.CollectionHealth:        4,
+}
+
+// migrationOrder sorts objs in place into the copy order described on
+// migrationRank: by class rank, then by path within a class.
+//
+// Deterministic and total — the path tiebreak matters because the
+// chunking cursor is an index into this ordering, so two calls over the
+// same listing must produce the same sequence or a resume lands in the
+// wrong place. An unranked class (impossible today: CollectionNameFor
+// falls back to `kv`) sorts after every ranked one rather than
+// panicking.
+func migrationOrder(objs []storage.StoredObject) {
+	rank := func(path string) int {
+		if r, ok := migrationRank[storage.CollectionNameFor(path)]; ok {
+			return r
+		}
+		return len(migrationRank)
+	}
+	sort.SliceStable(objs, func(i, j int) bool {
+		ri, rj := rank(objs[i].Path), rank(objs[j].Path)
+		if ri != rj {
+			return ri < rj
+		}
+		return objs[i].Path < objs[j].Path
+	})
 }
 
 // jsonRoundTrip is a defensive sanity-check for a document body: a JSON
