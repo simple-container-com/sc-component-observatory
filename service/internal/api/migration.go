@@ -5,6 +5,7 @@ package api
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -99,7 +100,12 @@ func (c *MigrationConfig) Migrate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "migration endpoint disabled (ADMIN_MIGRATION_TOKEN unset)")
 		return
 	}
-	if r.Header.Get("X-Admin-Token") != c.AdminToken {
+	// Constant-time compare so a remote attacker cannot learn the
+	// token's length or prefix by timing the response. Low severity
+	// (shared bearer, remote timing), trivially cheap, brings
+	// observatory consistent with notifier + backup#41.
+	got := r.Header.Get("X-Admin-Token")
+	if subtle.ConstantTimeCompare([]byte(got), []byte(c.AdminToken)) != 1 {
 		writeErr(w, http.StatusUnauthorized, "missing or invalid X-Admin-Token")
 		return
 	}
