@@ -8,7 +8,8 @@
 // Pattern mirrors go-embedb's cmd/smoke-lambda/main.go bootEmbed(): one
 // cold-start boot, a package-scoped FerretDB instance plus a connected
 // mongo.Client, every subsequent handler call reuses both. The Lambda-
-// specific knobs (AckWaitLiveOnly, large HeartbeatTTL, auto replicaId
+// specific knobs (AckWaitLiveOnly, large HeartbeatTTL, a RecoveryTimeout
+// sized against our own 300s function timeout, auto replicaId
 // from AWS_LAMBDA_LOG_STREAM_NAME) are hard-wired on when
 // AWS_LAMBDA_FUNCTION_NAME is set, so an operator who enables
 // USE_GOEMBEDB does not have to remember Bug 13.
@@ -83,9 +84,9 @@ func bootGoEmbedOnce(logger *slog.Logger) (*goEmbed, error) {
 		ReplSetName: replSet,
 	}
 
-	// Replication substrate. OPTIONAL on long-lived hosts (ECS / VM /
-	// local smoke) — a single-node embed is a valid "just put it in
-	// sqlite" deploy because the one writer keeps state across requests.
+	// Shared storage. OPTIONAL on long-lived hosts (ECS / VM / local
+	// smoke) — a single-node embed is a valid "just put it in sqlite"
+	// deploy because the one writer keeps state across requests.
 	//
 	// HARD-REQUIRED on Lambda. Lambda's `/tmp` is per-container and dies
 	// with every container recycle, so "no bucket" means every warm
@@ -97,6 +98,22 @@ func bootGoEmbedOnce(logger *slog.Logger) (*goEmbed, error) {
 	// So on Lambda, refuse to boot rather than warn. Operator either
 	// sets GOEMBEDB_S3_BUCKET (step 2 of the cutover) or leaves
 	// USE_GOEMBEDB=0; there is no silent middle ground.
+	//
+	// What the paragraphs above USED to get wrong, and why the wording
+	// changed from "replication substrate" to "shared storage": all of it
+	// was true and it still licensed a configuration that lost every
+	// document on every cold start. Before go-embedb #32 the S3 layer was
+	// a *replication* substrate only — every read path was keyed on the
+	// slot manager's LiveWriters() and nothing ever replayed a replica's
+	// own log, so state survived because another LIVE replica had applied
+	// it. A Lambda has normally zero or one container, so there was never
+	// an overlapping peer and setting the bucket bought nothing for the
+	// sequential case. Live-caught 2026-11-24: a verified ~9100-document
+	// migration read back zero rows after the next deploy. #32 adds the
+	// recovery path that makes the bucket a durability substrate too, so
+	// "set the bucket" is finally the remedy this comment always claimed
+	// it was. Do not weaken the refusal below: without a bucket there is
+	// still nothing to recover from.
 	if bucket := os.Getenv("GOEMBEDB_S3_BUCKET"); bucket != "" {
 		region := envOrDefault("GOEMBEDB_S3_REGION", os.Getenv("AWS_REGION"))
 		rep := &ferretdb.ReplicationStorageConfig{
@@ -105,34 +122,13 @@ func bootGoEmbedOnce(logger *slog.Logger) (*goEmbed, error) {
 			S3Prefix: goEmbedS3Prefix(),
 			S3Region: region,
 		}
-		if max := envIntOrZero("GOEMBEDB_MAX_REPLICAS"); max > 0 {
-			rep.MaxReplicas = max
-		}
-		if ttl := envDurationOrZero("GOEMBEDB_HEARTBEAT_TTL"); ttl > 0 {
-			rep.HeartbeatTTL = ttl
-		}
-		// Lambda-correctness defaults. Explicit env overrides win so a
-		// long-lived deploy (ECS / VM) can turn them off, but the common
-		// case — observatory IS a Lambda — gets Bug 13 right without the
-		// operator remembering it.
-		if isLambda() {
-			if rep.HeartbeatTTL == 0 {
-				rep.HeartbeatTTL = 3 * time.Minute
-			}
-			if rep.MaxReplicas == 0 {
-				rep.MaxReplicas = 10
-			}
-			rep.AckWaitLiveOnly = true
-		}
-		// Explicit override still wins (useful for a non-Lambda deploy
-		// that nonetheless wants live-only — e.g. a smoke).
-		if envBool("GOEMBEDB_ACK_WAIT_LIVE_ONLY") {
-			rep.AckWaitLiveOnly = true
-		}
+		applyReplicationKnobs(rep, isLambda())
+
 		cfg.ReplicationStorage = rep
 		logger.Info("goembedb replication configured",
 			"bucket", rep.S3Bucket, "prefix", rep.S3Prefix, "region", rep.S3Region,
-			"ackWaitLiveOnly", rep.AckWaitLiveOnly, "heartbeatTTL", rep.HeartbeatTTL)
+			"ackWaitLiveOnly", rep.AckWaitLiveOnly, "heartbeatTTL", rep.HeartbeatTTL,
+			"recoveryTimeout", rep.RecoveryTimeout)
 	} else if isLambda() {
 		return nil, fmt.Errorf("goembedb: GOEMBEDB_S3_BUCKET is required on Lambda — /tmp is per-container and ephemeral, which resets observatory's up/down edge state across container recycles and produces spurious alerts. Set GOEMBEDB_S3_BUCKET (step 2 of the cutover) or leave USE_GOEMBEDB=0")
 	} else {
@@ -181,6 +177,69 @@ func bootGoEmbedOnce(logger *slog.Logger) (*goEmbed, error) {
 		cancel:  cancel,
 		runDone: runDone,
 	}, nil
+}
+
+// applyReplicationKnobs resolves every go-embedb replication knob that is
+// not simply "copy the env var in": the explicit env overrides first, then
+// the Lambda-correctness defaults for anything still unset.
+//
+// Extracted from bootGoEmbedOnce so the defaults are assertable without
+// standing up a FerretDB instance against a real bucket — the boot path
+// calls this and nothing else, so there is no second implementation to
+// drift. `lambda` is passed rather than read from the environment for the
+// same reason.
+//
+// Explicit env overrides win so a long-lived deploy (ECS / VM) can turn
+// the Lambda defaults off, but the common case — observatory IS a Lambda —
+// gets Bug 13 right without the operator remembering it.
+func applyReplicationKnobs(rep *ferretdb.ReplicationStorageConfig, lambda bool) {
+	if max := envIntOrZero("GOEMBEDB_MAX_REPLICAS"); max > 0 {
+		rep.MaxReplicas = max
+	}
+
+	if ttl := envDurationOrZero("GOEMBEDB_HEARTBEAT_TTL"); ttl > 0 {
+		rep.HeartbeatTTL = ttl
+	}
+
+	if rt := envDurationOrZero("GOEMBEDB_RECOVERY_TIMEOUT"); rt > 0 {
+		rep.RecoveryTimeout = rt
+	}
+
+	if lambda {
+		if rep.HeartbeatTTL == 0 {
+			rep.HeartbeatTTL = 3 * time.Minute
+		}
+
+		if rep.MaxReplicas == 0 {
+			rep.MaxReplicas = 10
+		}
+
+		rep.AckWaitLiveOnly = true
+
+		// go-embedb #32's cold-start log replay. Its own default is 90s,
+		// chosen to stay under a typical function timeout; ours is
+		// `timeout: 300` (set for the chunked migration), so we can
+		// afford more — and the FIRST start after the #32 pin needs it.
+		// Recovery resumes from SnapshotMeta.AppliedOffsets, which
+		// snapshots written by the pre-#32 code do not carry, so that one
+		// start has no inherited watermark and replays every slot from
+		// zero. Every later start inherits a watermark and is cheap.
+		//
+		// 240s not 300s: a replay that overruns is deliberately fatal
+		// inside go-embedb, and a loud boot failure we can read is worth
+		// more than a request timeout with nothing logged. Keep this
+		// strictly below the Lambda timeout so the engine is the thing
+		// that gives up first.
+		if rep.RecoveryTimeout == 0 {
+			rep.RecoveryTimeout = 240 * time.Second
+		}
+	}
+
+	// Explicit override still wins (useful for a non-Lambda deploy that
+	// nonetheless wants live-only — e.g. a smoke).
+	if envBool("GOEMBEDB_ACK_WAIT_LIVE_ONLY") {
+		rep.AckWaitLiveOnly = true
+	}
 }
 
 // goEmbedS3Prefix is the ONE place the replication prefix is resolved.
