@@ -35,6 +35,28 @@ type SessionConfig struct {
 
 	// CookieTTL defaults to 12h.
 	CookieTTL time.Duration
+
+	// Version is the build stamp (`main.version`, CalVer
+	// `vYYYY.MM.DD-<sha>`), reported by the session probe to an
+	// AUTHENTICATED caller only.
+	//
+	// It exists because a pin bump was unverifiable from outside. The
+	// binary logs its version once at boot (cmd/observatory/main.go) and
+	// `/healthz` answers a bare "ok" — the exact commit SHA used to ride
+	// on that same `/healthz` body and was pulled off it for the reason
+	// this field exists: an unauthenticated reader must not learn a
+	// private repo's commit SHA. Reading CloudWatch for the boot log
+	// needs AWS credentials an operator smoking a deploy usually does
+	// not have, so "the provision went green" was the only available
+	// evidence that a new image was serving — which is evidence that
+	// the apply ran, not that this process is the build you merged.
+	//
+	// Authenticated-only on purpose: the value is an exact commit SHA
+	// of a private repo, and `/api/v1/session` is reachable
+	// unauthenticated by design (the SPA needs it before it holds a
+	// cookie). Gating it adds the verification without widening what an
+	// anonymous caller learns.
+	Version string
 }
 
 func (c *SessionConfig) cookieTTL() time.Duration {
@@ -56,10 +78,16 @@ func (c *SessionConfig) Session(w http.ResponseWriter, r *http.Request) {
 	if raw := tokenFromRequest(r); raw != "" {
 		authed = c.verify(raw)
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{
+	resp := map[string]any{
 		"authenticated": authed,
 		"password_set":  c.OperatorPassword != "",
-	})
+	}
+	// Only for a caller who proved they hold the operator password —
+	// see the Version field comment for why it is not unconditional.
+	if authed {
+		resp["version"] = c.Version
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // Login serves `POST /api/v1/login` with body `{"password": "..."}`.

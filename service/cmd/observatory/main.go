@@ -213,6 +213,10 @@ func run() error {
 		OperatorPassword: operatorPassword,
 		// Secure cookies unless explicitly developing over plain HTTP.
 		CookieSecure: envOr("COOKIE_INSECURE", "") == "",
+		// So a post-deploy smoke can prove WHICH build is serving. The
+		// boot log below carries the same value, but reading it needs
+		// AWS credentials; this needs the operator password.
+		Version: version,
 	}
 	auth := api.JWTMiddleware([]byte(jwtSecret))
 
@@ -221,10 +225,19 @@ func run() error {
 	// Unauthenticated: health + the session probe + login/logout. The
 	// probe MUST be outside the auth group or the SPA cannot ask
 	// "am I logged in?" without already being logged in.
+	//
+	// /healthz carries a bare "ok" and nothing else. The build stamp
+	// used to ride on this body, which handed an exact commit SHA of a
+	// private repo to any anonymous caller who could reach
+	// monitor.simple-forge.com. That lived here because a pin bump
+	// otherwise had no outside-the-VPC verification; the version now
+	// rides on the AUTHENTICATED session probe (see
+	// api.SessionConfig.Version), which gives an operator the same
+	// evidence without widening what an anonymous caller learns.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `{"status":"ok","version":%q,"commit":%q}`, version, commit)
+		fmt.Fprint(w, `{"status":"ok"}`)
 	})
 	mux.HandleFunc("GET /api/v1/session", session.Session)
 	mux.HandleFunc("POST /api/v1/login", session.Login)
