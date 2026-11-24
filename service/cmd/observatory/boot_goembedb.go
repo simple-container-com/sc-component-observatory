@@ -29,6 +29,8 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/readpref"
 
 	"github.com/FerretDB/FerretDB/ferretdb"
+
+	"github.com/simple-container-com/sc-component-observatory/service/internal/storage"
 )
 
 // goEmbed is the booted state. Accessed through bootGoEmbed below;
@@ -100,7 +102,7 @@ func bootGoEmbedOnce(logger *slog.Logger) (*goEmbed, error) {
 		rep := &ferretdb.ReplicationStorageConfig{
 			Backend:  "s3",
 			S3Bucket: bucket,
-			S3Prefix: envOrDefault("GOEMBEDB_S3_PREFIX", "sc-component-observatory/"),
+			S3Prefix: goEmbedS3Prefix(),
 			S3Region: region,
 		}
 		if max := envIntOrZero("GOEMBEDB_MAX_REPLICAS"); max > 0 {
@@ -179,6 +181,15 @@ func bootGoEmbedOnce(logger *slog.Logger) (*goEmbed, error) {
 		cancel:  cancel,
 		runDone: runDone,
 	}, nil
+}
+
+// goEmbedS3Prefix is the ONE place the replication prefix is resolved.
+// Both the boot path (which hands it to ferretdb) and the migration
+// endpoint (which must exclude it from the source listing) call this,
+// so an operator who overrides GOEMBEDB_S3_PREFIX cannot move the
+// replication records out from under the exclusion.
+func goEmbedS3Prefix() string {
+	return envOrDefault("GOEMBEDB_S3_PREFIX", storage.DefaultGoEmbedS3Prefix)
 }
 
 func envOrDefault(name, def string) string {
