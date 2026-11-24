@@ -252,9 +252,33 @@ MUTATIONS = [
      '\tmigrationToken, err := resolveAWSSecretARN(ctx, "ADMIN_MIGRATION_TOKEN", os.Getenv("ADMIN_MIGRATION_TOKEN"))',
      "\tmigrationToken, err := os.Getenv(\"ADMIN_MIGRATION_TOKEN\"), error(nil)",
      "TestSecretEnvVarsAreResolvedByTheService", 1),
+
+    # ARN-exit calibration — mirrors sc-component-backup#46's. Observatory
+    # hasn't shipped the ARN-read-by-nothing bug, but shares the shape.
+    # Mutation replaces the error-return with `_ = err`, letting the empty
+    # resolved value fall through. The test's anti-marker then catches
+    # the secondary guard firing — without it, the `len < 32` fallthrough
+    # (SERVICE_JWT_SECRET) or the "startup serves successfully" fallthrough
+    # (OBSERVATORY_OPERATOR_PASSWORD) would produce a false CAUGHT on a
+    # bare exit-code assertion.
+    #
+    # Live-caught on backup#46 writing the equivalent: the first version
+    # of the SERVICE_JWT_SECRET test reported NOT CAUGHT because
+    # `jwtSecret = ""` tripped the len-check Exit(2) with the same exit
+    # code and a different slog message. The anti-marker closes that gap.
+    ("arn-exit", "SERVICE_JWT_SECRET resolve failure no longer exits", SVC_MAIN, SVC_CMD_PKG,
+     '\t\treturn fmt.Errorf("resolve SERVICE_JWT_SECRET: %w", err)',
+     '\t\t_ = err',
+     "TestBinaryExitsTwoOnServiceJWTSecretArnResolveFailure", 1),
+
+    ("arn-exit", "OBSERVATORY_OPERATOR_PASSWORD resolve failure no longer exits", SVC_MAIN, SVC_CMD_PKG,
+     '\t\treturn fmt.Errorf("resolve OBSERVATORY_OPERATOR_PASSWORD: %w", err)',
+     '\t\t_ = err',
+     "TestBinaryExitsTwoOnOperatorPasswordArnResolveFailure", 1),
 ]
 
 TEST_FILE_PREFIXES = (
+    "arn_exit_test.go:",
     "services_test.go:", "deploys_test.go:", "health_tick_auth_test.go:",
     "metrics_test.go:", "logs_test.go:", "migration_test.go:",
     "config_test.go:", "tenant_env_test.go:",
