@@ -155,6 +155,21 @@ func TestMigration_DryRun(t *testing.T) {
 	defer cleanup()
 	sink := storage.NewMongoStore(client).WithDatabase("obs_migration_dryrun")
 
+	// Pre-populate the sink with as many rows as the source holds.
+	// This is what makes the `!dryRun` clause load-bearing rather than
+	// decorative: on an EMPTY sink a dry run fails the row-count
+	// comparison anyway (0 rows vs 5 keys) and `verified` comes back
+	// false for the wrong reason, so the guard could be deleted and
+	// this test would not notice. With the sink already holding 5,
+	// every other clause is satisfied and only `!dryRun` keeps
+	// `verified` false.
+	for i := range 5 {
+		p := fmt.Sprintf("_meta/services/svc-%d.json", i)
+		if _, err := sink.Put(context.Background(), p, bytes.NewReader([]byte("x"))); err != nil {
+			t.Fatalf("seed sink: %v", err)
+		}
+	}
+
 	cfg := &api.MigrationConfig{Source: src, Sink: sink, AdminToken: "t"}
 
 	req := httptest.NewRequest(http.MethodPost, "/admin/migrate-s3-to-goembedb?dry_run=1", nil)
@@ -169,6 +184,7 @@ func TestMigration_DryRun(t *testing.T) {
 		DryRun   bool             `json:"dry_run"`
 		S3Count  int              `json:"s3_count"`
 		Total    int64            `json:"total_migrated"`
+		SinkRows int64            `json:"sink_rows"`
 		Verified bool             `json:"verified"`
 		Migrated map[string]int64 `json:"migrated"`
 	}
@@ -176,13 +192,144 @@ func TestMigration_DryRun(t *testing.T) {
 	if !resp.DryRun || resp.S3Count != 5 || resp.Total != 5 {
 		t.Fatalf("dry-run response wrong: %+v", resp)
 	}
+	// Premise check: every clause other than `!dryRun` is satisfied, so
+	// the guard below is the only thing that can hold `verified` false.
+	if resp.SinkRows != 5 {
+		t.Fatalf("sink_rows = %d, want 5 — the seeded sink is this test's premise", resp.SinkRows)
+	}
 	if resp.Verified {
 		t.Fatalf("dry-run claimed verified, which must never be")
 	}
-	// No writes should have landed.
-	if n := resp.Migrated[storage.CollectionServices]; n != 0 {
-		t.Fatalf("dry-run leaked write: services count = %d, want 0", n)
+	// No NEW writes should have landed — the 5 seeded rows, not 10.
+	if n := resp.Migrated[storage.CollectionServices]; n != 5 {
+		t.Fatalf("dry-run leaked write: services count = %d, want the 5 seeded rows", n)
 	}
+}
+
+// TestMigration_EmptySourceIsNotVerified — `verified` used to be
+// `sinkRows >= s3Count`, which is `0 >= 0` on an empty source. A
+// misconfigured Source (wrong bucket, wrong prefix, credentials that
+// list nothing) therefore reported the migration as a success, and
+// `verified` is the one field the runbook tells the operator to read.
+func TestMigration_EmptySourceIsNotVerified(t *testing.T) {
+	src := storage.NewInMemoryStore()
+
+	client, cleanup := embeddedMongo(t)
+	defer cleanup()
+	sink := storage.NewMongoStore(client).WithDatabase("obs_migration_empty")
+
+	cfg := &api.MigrationConfig{Source: src, Sink: sink, AdminToken: "t"}
+	req := httptest.NewRequest(http.MethodPost, "/admin/migrate-s3-to-goembedb", nil)
+	req.Header.Set("X-Admin-Token", "t")
+	w := httptest.NewRecorder()
+	cfg.Migrate(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Migrate: status %d, body %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		S3Count  int   `json:"s3_count"`
+		SinkRows int64 `json:"sink_rows"`
+		Verified bool  `json:"verified"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v (body %s)", err, w.Body.String())
+	}
+	if resp.S3Count != 0 {
+		t.Fatalf("s3_count = %d, want 0", resp.S3Count)
+	}
+	if resp.Verified {
+		t.Fatal("verified = true on an EMPTY source; a migration that copied nothing must never report success")
+	}
+}
+
+// TestMigration_ZeroCopiedIntoPopulatedSinkIsNotVerified — the other
+// way the old one-liner lied. `sink_rows` is the destination's WHOLE
+// row count, not a tally of this run's work, so a sink already
+// carrying live traffic satisfies `sinkRows >= s3Count` even when the
+// copy did nothing: this fixture seeds 5 unrelated rows, lists 2
+// source keys, and rigs every Get to fail.
+//
+// Be precise about what this covers. TWO clauses of the handler's
+// `verified` independently rule this fixture out — `len(Errors) == 0`
+// (the failed Gets are recorded) and `Total == S3Count` (0 != 2) — so
+// mutating away either one on its own leaves this test green. That is
+// not a gap in the test: on today's loop the two conditions are
+// equivalent by construction (an error is exactly what makes a key
+// not counted), so no fixture can isolate one from the other. What is
+// pinned here is the composite outcome the operator actually reads:
+// a run that copied nothing into a bigger sink reports
+// `verified: false`, where the pre-hardening one-liner reported true.
+func TestMigration_ZeroCopiedIntoPopulatedSinkIsNotVerified(t *testing.T) {
+	client, cleanup := embeddedMongo(t)
+	defer cleanup()
+	sink := storage.NewMongoStore(client).WithDatabase("obs_migration_prepop")
+
+	// Seed the sink directly: 5 rows that have nothing to do with the
+	// source below.
+	for i := range 5 {
+		p := fmt.Sprintf("_meta/services/pre-%d.json", i)
+		if _, err := sink.Put(context.Background(), p, bytes.NewReader([]byte("{}"))); err != nil {
+			t.Fatalf("seed sink: %v", err)
+		}
+	}
+
+	// A source whose two keys both fail on Get.
+	src := &failingGetStore{keys: []string{"_meta/services/a.json", "_meta/services/b.json"}}
+
+	cfg := &api.MigrationConfig{Source: src, Sink: sink, AdminToken: "t"}
+	req := httptest.NewRequest(http.MethodPost, "/admin/migrate-s3-to-goembedb", nil)
+	req.Header.Set("X-Admin-Token", "t")
+	w := httptest.NewRecorder()
+	cfg.Migrate(w, req)
+
+	var resp struct {
+		S3Count  int   `json:"s3_count"`
+		Total    int64 `json:"total_migrated"`
+		SinkRows int64 `json:"sink_rows"`
+		Verified bool  `json:"verified"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v (body %s)", err, w.Body.String())
+	}
+	if resp.Total != 0 {
+		t.Fatalf("total_migrated = %d, want 0 (every Get was rigged to fail)", resp.Total)
+	}
+	if resp.SinkRows < int64(resp.S3Count) {
+		t.Fatalf("sink_rows = %d, want >= s3_count %d — the premise of this test is a sink that ALREADY satisfies the old comparison", resp.SinkRows, resp.S3Count)
+	}
+	if resp.Verified {
+		t.Fatal("verified = true when zero objects copied into an already-populated sink")
+	}
+}
+
+// failingGetStore lists keys that cannot be read. Models the shape the
+// pre-populated-sink hazard needs: a source the migration walks but
+// copies nothing from.
+type failingGetStore struct{ keys []string }
+
+func (f *failingGetStore) List(_ context.Context, _ string) ([]storage.StoredObject, error) {
+	objs := make([]storage.StoredObject, 0, len(f.keys))
+	for _, k := range f.keys {
+		objs = append(objs, storage.StoredObject{Path: k})
+	}
+	return objs, nil
+}
+
+func (f *failingGetStore) Get(_ context.Context, path string) (io.ReadCloser, error) {
+	return nil, fmt.Errorf("rigged failure for %q", path)
+}
+
+func (f *failingGetStore) Put(_ context.Context, _ string, _ io.Reader) (int64, error) {
+	return 0, errors.New("not implemented")
+}
+
+func (f *failingGetStore) Delete(_ context.Context, _ string) error {
+	return errors.New("not implemented")
+}
+
+func (f *failingGetStore) Presign(_ context.Context, _ string, _ time.Duration) (string, error) {
+	return "", errors.New("not implemented")
 }
 
 func TestMigration_AuthAndGate(t *testing.T) {

@@ -55,13 +55,20 @@ type MigrationConfig struct {
 // `Migrated` is the per-collection count the destination's documents
 // landed under (so an operator can diff against each class's expected
 // row count). `S3Count` is how many source objects the LIST walked.
-// Verified = true when the two totals agree AND no per-key error
-// fired; false (with Errors non-empty) otherwise.
+// `Verified` is deliberately conservative — see the comment at the
+// assignment for the three ways the obvious version of it reported
+// success on a bad migration.
 type migrationResponse struct {
-	DryRun    bool             `json:"dry_run"`
-	S3Count   int              `json:"s3_count"`
-	Migrated  map[string]int64 `json:"migrated"`
-	Total     int64            `json:"total_migrated"`
+	DryRun   bool             `json:"dry_run"`
+	S3Count  int              `json:"s3_count"`
+	Migrated map[string]int64 `json:"migrated"`
+	Total    int64            `json:"total_migrated"`
+	// SinkRows is the sum over Migrated — the destination's TOTAL row
+	// count, including anything that was there before this run. Exposed
+	// because it is one half of what `verified` compares, and an
+	// operator reading a bare `verified: true` cannot otherwise see
+	// whether the sink was empty beforehand.
+	SinkRows  int64            `json:"sink_rows"`
 	ElapsedMs int64            `json:"elapsed_ms"`
 	Verified  bool             `json:"verified"`
 	Errors    []migrationError `json:"errors,omitempty"`
@@ -84,8 +91,10 @@ type migrationError struct {
 //     with upsert means a retried migration overwrites, not
 //     duplicates.
 //  3. CollectionCounts on the sink produces the per-class row count
-//     the operator diffs against expectations. verified = (total of
-//     migrated per-collection == S3 LIST count).
+//     the operator diffs against expectations, and `sink_rows` their
+//     sum. `verified` requires a non-empty source, zero per-key
+//     errors, every listed key written, and the sink holding at least
+//     that many rows.
 //
 // Query parameter `dry_run=1` lists but does not write. Lets the
 // operator validate scope and count before touching Mongo.
@@ -168,16 +177,55 @@ func (c *MigrationConfig) Migrate(w http.ResponseWriter, r *http.Request) {
 		resp.Migrated = counts
 	}
 
-	// Verified: zero per-key errors AND the per-collection total
-	// matches the S3 LIST count. A dry run never claims verified.
-	if !dryRun && len(resp.Errors) == 0 {
-		var sum int64
-		for _, n := range resp.Migrated {
-			sum += n
-		}
-		resp.Verified = sum >= int64(resp.S3Count)
+	for _, n := range resp.Migrated {
+		resp.SinkRows += n
+	}
+
+	// Verified: zero per-key errors, every listed key actually written,
+	// a non-empty source, AND the sink holding at least as many rows as
+	// the source listed.
+	//
+	// Each clause is here because the obvious one-liner this replaced
+	// (`sum >= S3Count`) was computable as TRUE in three ways that had
+	// nothing to do with a good migration, and `verified` is the single
+	// field the runbook tells the operator to read:
+	//
+	//   - **Empty source.** 0 >= 0. A misconfigured Source (wrong
+	//     bucket, wrong prefix, credentials that list nothing) reports
+	//     success. Hence `S3Count > 0`.
+	//   - **Truncated source.** 1000 copied >= 1000 listed, when the
+	//     bucket held more. That was real: an unpaginated
+	//     `S3Store.List` clipped at the ListObjectsV2 page cap, and
+	//     because keys migrate in sorted path order the clip would have
+	//     copied `health/` ticks and never reached `services/`. Fixed
+	//     in storage/s3.go; `S3Count > 0` cannot catch it, so the fix
+	//     is the lister's and the warn below is the tripwire.
+	//   - **A sink that was already populated.** `sum` is the
+	//     DESTINATION's whole row count, not a tally of this run's
+	//     work, so a sink carrying live traffic satisfies
+	//     `sum >= S3Count` even if zero objects copied. Hence
+	//     `resp.Total == S3Count`, which counts successful Puts.
+	//
+	// `Total == S3Count` is implied by `len(Errors) == 0` on today's
+	// loop; it is stated anyway so a future path that counts
+	// differently cannot quietly re-open the hole. A dry run never
+	// claims verified.
+	if !dryRun && len(resp.Errors) == 0 && resp.S3Count > 0 {
+		resp.Verified = resp.Total == int64(resp.S3Count) && resp.SinkRows >= int64(resp.Total)
 	}
 	resp.ElapsedMs = time.Since(start).Milliseconds()
+
+	// A source count that is an exact multiple of 1000 is the signature
+	// of a list operation that stopped at a page boundary — AWS caps a
+	// ListObjectsV2 page at 1000 keys and signals the clip only via
+	// IsTruncated, which an unpaginated caller never reads. The real
+	// count landing on a round 1000 is possible but unlikely; a
+	// truncated one is certain to. Not a failure: the operator is the
+	// one who can tell which it is, and this is how they get asked.
+	if resp.S3Count > 0 && resp.S3Count%1000 == 0 {
+		slog.Warn("migration source count is an exact multiple of 1000 — may be a truncated (unpaginated) listing rather than a real count; audit the source lister before trusting `verified`",
+			"s3_count", resp.S3Count)
+	}
 
 	slog.Info("migration",
 		"dry_run", resp.DryRun,

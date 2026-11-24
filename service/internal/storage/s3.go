@@ -199,27 +199,70 @@ func (s *S3Store) Presign(ctx context.Context, path string, expires time.Duratio
 	return req.URL, nil
 }
 
+// s3ListAPI is the one method List needs. It exists so a test can
+// drive the pagination loop with a fake that actually honours
+// ContinuationToken — the concrete *s3.Client cannot be faked, and a
+// loop that re-requests page 1 forever is indistinguishable from a
+// correct one against any fake that ignores the token.
+type s3ListAPI interface {
+	ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+}
+
 func (s *S3Store) List(ctx context.Context, prefix string) ([]StoredObject, error) {
+	return listAllObjects(ctx, s.client, s.cfg.Bucket, prefix)
+}
+
+// listAllObjects walks EVERY page of a ListObjectsV2 result.
+//
+// A single ListObjectsV2 call returns at most 1000 keys and sets
+// IsTruncated — it does not error, warn, or indicate the clip in any
+// other way. This function used to be one unpaginated call, and the
+// bug it caused is worth recording because the symptom looked like
+// data: observatory's go-embedb migration dry-run reported
+// `s3_count: 1000` from a bucket holding more, and because the
+// migration's own `verified` is `sinkRows >= s3_count`, a wet run
+// would have copied the first page, compared 1000 against the
+// truncated 1000, and reported `verified: true` with the rest of the
+// bucket left behind. Worse than the raw clip: keys migrate in sorted
+// path order, so the first page is all `health/` ticks and `services/`
+// — the only records anyone reads — sort last and would never have
+// been reached.
+//
+// So: no caller may assume one page, and a count coming back as
+// exactly a multiple of 1000 deserves suspicion from whoever reads it.
+func listAllObjects(ctx context.Context, api s3ListAPI, bucket, prefix string) ([]StoredObject, error) {
 	prefix = strings.TrimPrefix(prefix, "/")
-	out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket: aws.String(s.cfg.Bucket),
-		Prefix: aws.String(prefix),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("s3 list %q: %w", prefix, err)
-	}
-	result := make([]StoredObject, 0, len(out.Contents))
-	for _, o := range out.Contents {
-		so := StoredObject{Path: aws.ToString(o.Key)}
-		if o.Size != nil {
-			so.Size = *o.Size
+	var (
+		result []StoredObject
+		token  *string
+	)
+	for {
+		out, err := api.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("s3 list %q: %w", prefix, err)
 		}
-		if o.LastModified != nil {
-			so.ModifiedAt = *o.LastModified
+		for _, o := range out.Contents {
+			so := StoredObject{Path: aws.ToString(o.Key)}
+			if o.Size != nil {
+				so.Size = *o.Size
+			}
+			if o.LastModified != nil {
+				so.ModifiedAt = *o.LastModified
+			}
+			result = append(result, so)
 		}
-		result = append(result, so)
+		// Trust IsTruncated, not the presence of a token: S3 returns
+		// NextContinuationToken only while truncated, and a nil-safe
+		// read of both is what keeps a single-page bucket from looping.
+		if out.IsTruncated == nil || !*out.IsTruncated || aws.ToString(out.NextContinuationToken) == "" {
+			return result, nil
+		}
+		token = out.NextContinuationToken
 	}
-	return result, nil
 }
 
 func (s *S3Store) Delete(ctx context.Context, path string) error {
