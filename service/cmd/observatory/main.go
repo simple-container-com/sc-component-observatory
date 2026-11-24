@@ -213,6 +213,13 @@ func run() error {
 		OperatorPassword: operatorPassword,
 		// Secure cookies unless explicitly developing over plain HTTP.
 		CookieSecure: envOr("COOKIE_INSECURE", "") == "",
+		// So the SPA can render a build label without reading /healthz
+		// separately. Same value the unauthenticated /healthz above
+		// publishes; writing it through the session probe is a wire
+		// that no handler-level test can observe (every one of them
+		// builds its own SessionConfig), so the version_wire_test.go
+		// binary test is the only honest assertion.
+		Version: version,
 	}
 	auth := api.JWTMiddleware([]byte(jwtSecret))
 

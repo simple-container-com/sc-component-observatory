@@ -35,6 +35,19 @@ type SessionConfig struct {
 
 	// CookieTTL defaults to 12h.
 	CookieTTL time.Duration
+
+	// Version is the build stamp this service was compiled with — the
+	// same `main.version` ldflag the /healthz probe already reports.
+	// Carried on the session probe so the SPA can render a build label
+	// on the operator page without reading /healthz separately.
+	//
+	// A CalVer `vYYYY.MM.DD-<short-sha>` is not a credential — the
+	// short SHA is already in every release/tag/image-ref — so it is
+	// written unauthenticated. The guard this field exists for is the
+	// same as /healthz: a smoke-time deploy verification signal, and
+	// that signal has to be reachable without AWS credentials or it
+	// is not a verification signal.
+	Version string
 }
 
 func (c *SessionConfig) cookieTTL() time.Duration {
@@ -56,9 +69,13 @@ func (c *SessionConfig) Session(w http.ResponseWriter, r *http.Request) {
 	if raw := tokenFromRequest(r); raw != "" {
 		authed = c.verify(raw)
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"authenticated": authed,
 		"password_set":  c.OperatorPassword != "",
+		// Ungated — see the SessionConfig.Version field comment on why
+		// a CalVer build stamp is not a credential. Mirrors
+		// sc-component-notifier#6's design.
+		"version": c.Version,
 	})
 }
 
