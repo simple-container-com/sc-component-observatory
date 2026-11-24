@@ -227,6 +227,15 @@ func (c *MigrationConfig) Migrate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "dry_run and verify are mutually exclusive: dry_run walks the copy loop without I/O, verify skips the loop entirely")
 		return
 	}
+	// A malformed limit is refused rather than defaulted, because
+	// `limit = 0` means UNBOUNDED here — so falling through on a parse
+	// error does not degrade to a conservative chunk, it runs the whole
+	// bucket. TestMigration_BadParams was mutated to confirm that: with
+	// the guard disabled, `limit=abc` copied every fixture instead of
+	// returning 400. On the real bucket (9105 objects) that is the
+	// unbounded, un-resumable run that outlives the Lambda timeout and
+	// returns nothing — exactly what chunking exists to avoid, reached
+	// by a typo.
 	limit := 0
 	if raw := q.Get("limit"); raw != "" {
 		n, perr := strconv.Atoi(raw)
