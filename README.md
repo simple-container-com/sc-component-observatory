@@ -64,8 +64,8 @@ Target is under ten lines; anything derivable is derived by the plugin.
 my-observatory:
   type: sc-observatory
   config:
-    deployTo: lambda
-    image: simplecontainer/sc-component-observatory:v2026.11.xx
+    deployTo: lambda                   # picks the template; everything
+                                       # derivable is derived from it
     ingress:
       hostname: observatory.example.com
     storage: observatory-data          # name of another SC resource
@@ -75,38 +75,33 @@ my-observatory:
     # Only during the S3 -> go-embedb cutover; see Storage below.
     # Remove it afterwards and the migration route is not mounted.
     # migrationToken: "${secret:observatory-migration-token}"
-    # REQUIRED, and the one block that is not derivable. Without it
-    # nothing ever probes: the service runs the sweep inline when its
-    # tick endpoint is called and nothing calls it on its own, and a
-    # Lambda cannot hold a ticker. Retention rides the same tick.
-    #
-    # It lives here rather than in the component's defaults because SC
-    # resolves `${secret:NAME}` inside a schedule request but not the
-    # `${resource:...}` form, and a generic component cannot hardcode
-    # one stack's secret name. Paste as-is; only the secret name and the
-    # interval are yours to change.
-    cloudExtras:
-      lambdaSchedules:
-        - name: hc-tick                # <= 14 chars, rejected at APPLY
-          expression: "rate(5 minutes)"
-          request: |-
-            {
-              "requestId": "scheduled-healthcheck",
-              "httpMethod": "POST",
-              "path": "/api/v1/scheduler/healthcheck/tick",
-              "requestContext": {
-                "http": {
-                  "path": "/api/v1/scheduler/healthcheck/tick",
-                  "method": "POST",
-                  "protocol": "HTTP/1.1"
-                }
-              },
-              "body": "{}",
-              "headers": {
-                "Authorization": "Bearer ${secret:observatory-scheduler-token}"
-              }
-            }
 ```
+
+Nine lines, and every one of them is a decision only the operator can make: which template,
+which hostname, which bucket, which credentials. Everything else comes from
+`deployTo: lambda`:
+
+| Derived | Value |
+|---|---|
+| `image` | `simplecontainer/sc-component-observatory:<this plugin's version>` — the plugin and the image are released together off one CalVer tag, so pinning the plugin pins the image |
+| `maxMemory` / `timeout` | `512` / `300` — measured; SC's own defaults are 128/30 and the healthcheck sweep does not fit in them |
+| `cloudExtras.lambdaRoutingType` | `function-url` |
+| `cloudExtras.awsRoles` | the least-privilege read set the service actually calls, granted to the function's own identity — no access key is created |
+| `cloudExtras.lambdaSchedules` | the `hc-tick` rule, `rate(5 minutes)`, presenting your `schedulerToken` |
+| `storage.type` / `metadata.type` | `s3` / `colocated` |
+| `env.STORAGE_BUCKET` / `STORAGE_REGION` | from your `storage:` block |
+| `env.USE_GOEMBEDB` / `GOEMBEDB_S3_BUCKET` | `1`, and the same bucket under its own prefix |
+
+**Overriding any of them is one key in `config:`** — operator wins per key. Two cautions:
+a list value is taken **wholesale**, not merged, so writing your own `awsRoles` replaces
+the component's set rather than adding to it; and `storage:` has two shapes that do not
+agree — a bare `storage: observatory-data` grows a `--<env>` suffix, while
+`storage: {bucket: observatory-data}` is taken verbatim.
+
+The schedule in particular used to be a ~30-line block every operator pasted by hand,
+because an early failure was read as "SC cannot resolve `${resource:...}` inside a schedule
+payload". It can; the sentinel just has to be at position 0 of the payload rather than
+beside the token. See `schedulerTickRequest` in `plugin/cmd/sc-component-observatory/main.go`.
 
 `schedulerToken` is an HS256 JWT signed with `signingKey`, carrying
 `{"op":"scheduler"}`. The tick requires that op, so the credential sitting in the

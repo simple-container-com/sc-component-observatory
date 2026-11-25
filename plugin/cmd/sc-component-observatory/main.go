@@ -26,6 +26,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 
@@ -73,12 +74,18 @@ func (p *observatoryPlugin) SetBroker(b *hplugin.GRPCBroker) { p.broker = b }
 //   - the self-URL and bucket placeholders resolve from PreProvision
 //     tpl extensions; see Schema's SupportsPreProvision note.
 var componentDefaultsJSON = func() []byte {
-	b, err := json.Marshal(map[string]any{
+	defaults := map[string]any{
 		"deployTo":  "lambda",
 		"maxMemory": 512,
-		"timeout":   30,
-		"metadata":  map[string]any{"type": "colocated"},
-		"storage":   map[string]any{"type": "s3"},
+		// 300 s, not SC's 30. This is NOT about a slow handler: it is
+		// the healthcheck tick, which fans out across every registered
+		// service in every registered tenant and probes each one. The
+		// operator of the fleet stack had already overridden 30 to 300
+		// by hand, which is the clearest possible signal that the
+		// default was wrong rather than that their workload is unusual.
+		"timeout":  300,
+		"metadata": map[string]any{"type": "colocated"},
+		"storage":  map[string]any{"type": "s3"},
 		// The permissions this component needs, declared BY THE
 		// COMPONENT and granted BY THE TEMPLATE.
 		//
@@ -109,39 +116,27 @@ var componentDefaultsJSON = func() []byte {
 			// routes answers 404 for all of them — the stage-prefix
 			// doubling that cost sc-component-backup a deploy cycle.
 			"lambdaRoutingType": "function-url",
-			// NO lambdaSchedules HERE — see below. The timer is real and
-			// required, but its Authorization header cannot be expressed
-			// in these generic defaults.
-			//
-			// The service exposes POST
+			// The healthcheck sweep's timer. The service exposes POST
 			// /api/v1/scheduler/healthcheck/tick and runs the sweep
 			// inline when called; nothing calls it on its own, and a
 			// Lambda cannot hold a ticker (the runtime freezes
 			// background goroutines when the handler returns). So the
 			// timer has to be a platform resource — on aws-lambda, an
-			// EventBridge rule built from `cloudExtras.lambdaSchedules`.
+			// EventBridge rule built from this key.
 			//
-			// Why the OPERATOR declares it rather than this file:
-			// SC resolves `${secret:NAME}` inside a schedule's request
-			// payload, but NOT the `$$sc:${resource:<name>.key}`
-			// tpl-extension form. Live-proven 2026-11-19 — the rule was
-			// created correctly, fired on time, and the tick answered
-			// 401 twice (10:56:13, 11:01:13) because its input held the
-			// literal string `Bearer $$sc:${resource:${name}.scheduler-token}`.
-			//
-			// A generic component cannot hardcode one stack's secret
-			// NAME, and the only form that resolves there needs exactly
-			// that. So the schedule block lives in the operator's
-			// server.yaml, which this component's README spells out
-			// verbatim, and `schedulerToken` stays on the allowlist so
-			// the operator declares the credential once.
-			//
-			// Follow-up that would move this back here: teach SC core's
-			// placeholder pass to walk `cloudExtras`. Until then,
-			// keeping a non-resolving schedule in the defaults would be
-			// worse than none — it produces a rule that fires every five
-			// minutes and 401s, which reads as "the dashboard is broken"
-			// rather than "configure the token".
+			// This block used to carry a ~25-line comment explaining
+			// that it CANNOT live here, and the operator wrote it by
+			// hand instead. That comment was a misdiagnosis; see
+			// [schedulerTickRequest] for what actually went wrong on
+			// 2026-11-19 and why the sentinel's POSITION is the whole
+			// difference.
+			"lambdaSchedules": []any{
+				map[string]any{
+					"name":       "hc-tick",
+					"expression": "rate(5 minutes)",
+					"request":    schedulerTickRequest("scheduled-healthcheck", "/api/v1/scheduler/healthcheck/tick"),
+				},
+			},
 			"awsRoles": []string{
 				// Storage — the component's own bucket: registry
 				// records, deploy history, health results.
@@ -190,8 +185,37 @@ var componentDefaultsJSON = func() []byte {
 			// silently fell back to a broken path).
 			"STORAGE_BUCKET": "$$sc:${resource:${name}.storage-bucket}",
 			"STORAGE_REGION": "$$sc:${resource:${name}.storage-region}",
+			// go-embedb is the metadata engine, not an opt-in
+			// experiment. The colocated S3 store it replaced served
+			// read-modify-write upserts only from whichever warm
+			// execution environment held the lease and answered
+			// NotWritablePrimary(10107) from every other one, which is
+			// not a tuning problem — it is a correctness one, and it
+			// cost this component a generation of registry data. An
+			// operator who leaves this unset should get the engine the
+			// fleet actually runs.
+			"USE_GOEMBEDB": "1",
+			// The bucket go-embedb keeps its log + snapshots in: the
+			// SAME bucket as the component's own data, under its own
+			// prefix (GOEMBEDB_S3_PREFIX, defaulted in the service).
+			// One bucket means one lifecycle policy and one set of
+			// grants, and the `awsRoles` above already cover it.
+			//
+			// Derived from the same tpl extension STORAGE_BUCKET uses,
+			// so the two cannot name different buckets — which was a
+			// live hazard while this was a hand-written server.yaml
+			// line, because a bare `storage: sc-observatory-data` grows
+			// a `--<env>` suffix that an operator repeating the base
+			// name by hand does not.
+			"GOEMBEDB_S3_BUCKET": "$$sc:${resource:${name}.storage-bucket}",
 		},
-	})
+	}
+	// The service image this plugin version ships with; see
+	// [defaultImage]. Omitted for an unstamped build.
+	if img := defaultImage(); img != "" {
+		defaults["image"] = img
+	}
+	b, err := json.Marshal(defaults)
 	if err != nil {
 		// A bad defaults payload would otherwise cascade into every
 		// Schema() RPC; fail at load instead.
@@ -199,6 +223,97 @@ var componentDefaultsJSON = func() []byte {
 	}
 	return b
 }()
+
+// imageRepo is the Docker Hub repository this plugin's service image is
+// published to. Kept beside [defaultImage] because the two are a pair:
+// release.yml pushes `<imageRepo>:<tag>` and stamps `<tag>` into
+// [version] in the same job, off the same CalVer value.
+const imageRepo = "simplecontainer/sc-component-observatory"
+
+// defaultImage is the service image that matches THIS plugin binary.
+//
+// The plugin and its service image are released together —
+// `.github/workflows/release.yml` computes one CalVer tag, stamps it
+// into `main.version` with `-ldflags -X`, and pushes
+// `simplecontainer/sc-component-observatory:<that same tag>`. So the
+// binary already knows the image it belongs with, and an operator who
+// pins the plugin version has, by construction, pinned the image too.
+//
+// Defaulting it here is therefore not a convenience — it ENFORCES the
+// lockstep. Two pins for one release is two chances to bump one and not
+// the other, and a plugin running against a mismatched service image
+// fails in whichever way the contract happened to change that week,
+// with nothing in the config to point at.
+//
+// Returns "" for an unstamped build (`version` is "dev" for a local
+// `go build`), so a developer gets SC's own "image required" error
+// instead of a pull of a tag that was never pushed.
+func defaultImage() string {
+	if version == "" || version == "dev" {
+		return ""
+	}
+
+	return imageRepo + ":" + version
+}
+
+// schedulerTickRequest renders the EventBridge target input that drives
+// the healthcheck sweep.
+//
+// THE SENTINEL POSITION IS THE WHOLE TRICK, and it is why this default
+// was previously believed impossible. `substituteString`
+// (api `pkg/clouds/pulumi/api/defaults_interpolation.go:174`) returns
+// the string UNCHANGED unless it BEGINS with `$$sc:`. So the obvious
+// shape — the sentinel next to the token it guards, as in
+// `"Bearer $$sc:${resource:${name}.scheduler-token}"` — is skipped in
+// silence. That is exactly what shipped here on 2026-11-19: the rule
+// was created, fired on time, and the tick answered 401 twice
+// (10:56:13, 11:01:13) with the literal
+// `Bearer $$sc:${resource:${name}.scheduler-token}` in its input.
+//
+// The conclusion drawn then was that SC resolves `${secret:NAME}`
+// inside a schedule payload but not the tpl-extension form, and that a
+// generic component therefore cannot ship a schedule at all. A ~25-line
+// comment to that effect went into all three components (it was where
+// this function now stands), and every operator has been writing this
+// block by hand since. It was a misdiagnosis.
+//
+// With the sentinel at position 0 of the WHOLE payload: `${name}`
+// substitutes, the sentinel is stripped, and core's post-PreProvision
+// `ResolvePlaceholders` pass (`plugin_sidecars.go:1580`) walks into
+// `cloudExtras.lambdaSchedules[].request` — a string inside a map
+// inside a slice — and substitutes `${resource:…}` mid-string. No core
+// change required.
+//
+// Constraint worth keeping in view: a schedule `name` longer than 14
+// characters is rejected at APPLY, after preview has passed.
+func schedulerTickRequest(requestID, path string) string {
+	req := map[string]any{
+		"requestId":  requestID,
+		"httpMethod": http.MethodPost,
+		"path":       path,
+		"requestContext": map[string]any{
+			"http": map[string]any{
+				"path":     path,
+				"method":   http.MethodPost,
+				"protocol": "HTTP/1.1",
+			},
+		},
+		"body": "{}",
+		"headers": map[string]any{
+			"Authorization": "Bearer ${resource:${name}.scheduler-token}",
+		},
+	}
+	b, err := json.Marshal(req)
+	if err != nil {
+		// Unreachable: every value above is a marshallable literal.
+		// Panic rather than ship a schedule whose input is empty — a
+		// rule that fires every five minutes and 400s reads as "the
+		// dashboard is broken".
+		panic("sc-component-observatory: schedulerTickRequest: " + err.Error())
+	}
+
+	return pApi.DefaultsSentinel + string(b)
+}
 
 func (p *observatoryPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scpluginv1.SchemaResponse, error) {
 	return &scpluginv1.SchemaResponse{
