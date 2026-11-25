@@ -32,7 +32,7 @@ require (
 // from this repo's own SC registry (`.sc/secrets.yaml`, decrypted with
 // the single org-level SC_CONFIG) and reach the Docker build as a buildx
 // secret mount — Dockerfile stage `go-builder`.
-replace github.com/FerretDB/FerretDB => github.com/simple-container-com/go-embedb v0.0.0-20261125184815-2d8f727d521e
+replace github.com/FerretDB/FerretDB => github.com/simple-container-com/go-embedb v0.0.0-20261125204549-41d97415018d
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
