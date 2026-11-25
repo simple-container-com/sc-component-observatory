@@ -207,7 +207,24 @@ func applyReplicationKnobs(rep *ferretdb.ReplicationStorageConfig, lambda bool) 
 
 	if lambda {
 		if rep.HeartbeatTTL == 0 {
-			rep.HeartbeatTTL = 3 * time.Minute
+			// 15m, NOT 3m, and the number comes from this component's
+			// own tick cadence rather than being picked.
+			//
+			// go-embedb's loops no longer run on their own tickers
+			// here — a frozen Lambda does not tick, so they never
+			// fired. They are driven from the EventBridge `hc-tick`
+			// rule, which is `rate(5 minutes)`. A heartbeat TTL has
+			// to outlast that cadence with margin or the slot is
+			// renewed on every tick and still reads as EXPIRED to
+			// peers in between, which from the outside is
+			// indistinguishable from never renewing: peers see a dead
+			// replica, LiveWriters is empty, no readers start.
+			//
+			// 3x the cadence tolerates two missed ticks.
+			// Handler.TickNow warns when the TTL is under 2x the
+			// cadence it actually observes, so re-timing hc-tick
+			// without revisiting this shows up in the log.
+			rep.HeartbeatTTL = 15 * time.Minute
 		}
 
 		if rep.MaxReplicas == 0 {

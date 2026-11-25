@@ -149,6 +149,12 @@ func run() error {
 		location        string
 		migrationSource storage.Store
 		migrationSink   *storage.MongoStore
+
+		// replicationTick drives go-embedb's five background loops from
+		// the healthcheck tick. Nil unless the embed is in use — see
+		// api.HealthConfig.ReplicationTick for why a ticker goroutine
+		// cannot do this job on Lambda.
+		replicationTick func(context.Context) error
 	)
 	useGoEmbedb := envOr("USE_GOEMBEDB", "") == "1"
 
@@ -185,6 +191,7 @@ func run() error {
 		migrationSink = mongoStore
 		objects = mongoStore
 		location = "goembedb://" + embed.ReplSet
+		replicationTick = embed.FDB.TickNow
 	}
 
 	if objects == nil {
@@ -278,6 +285,8 @@ func run() error {
 		Prober:      health.NewHTTPProber(time.Duration(envInt("HEALTHCHECK_TIMEOUT_SECONDS", 5)) * time.Second),
 		DefaultPath: envOr("HEALTHCHECK_PATH", "/healthz"),
 		RetainDays:  envInt("HEALTHCHECK_RETAIN_DAYS", 30),
+
+		ReplicationTick: replicationTick,
 	}
 	mux.Handle("POST /api/v1/scheduler/healthcheck/tick", auth(http.HandlerFunc(healthCfg.Tick)))
 	mux.Handle("GET /api/v1/services/{stack}/health", auth(http.HandlerFunc(healthCfg.History)))
