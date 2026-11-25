@@ -4,6 +4,7 @@
 package api
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"time"
@@ -26,6 +27,24 @@ type HealthConfig struct {
 
 	// Now is injected for tests.
 	Now func() time.Time
+
+	// ReplicationTick drives go-embedb's background replication loops
+	// once, synchronously. Wired to [ferretdb.FerretDB.TickNow] when
+	// the embed is in use; nil otherwise.
+	//
+	// It lives on this handler because the `hc-tick` EventBridge rule
+	// is the only thing in this service that runs on a real invocation
+	// which stays awake until its work finishes. go-embedb's five
+	// loops are wall-clock tickers, and Lambda freezes the container
+	// the moment the response flushes — so a loop fires only if ONE
+	// invocation outlives its period, which at a 5-minute cadence
+	// against a 30-second heartbeat interval never happens. Measured
+	// 2026-11-25 across the fleet: slots stuck at
+	// `heartbeat == joinedAt`, replicas dead to their peers while
+	// serving traffic.
+	//
+	// See `forge/docs/roadmap/items/go-embedb-snapshot-ticker-starves-on-lambda.md`.
+	ReplicationTick func(context.Context) error
 }
 
 func (c *HealthConfig) now() time.Time {
@@ -64,6 +83,24 @@ func (c *HealthConfig) Tick(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "token op must be 'scheduler' or 'operator'")
 		return
 	}
+	// Drive the replication loops BEFORE the sweep, and before the
+	// registry check below: the heartbeat and leases must be renewed
+	// even on a stack whose registry is not wired yet, otherwise a
+	// half-configured component also silently stops replicating.
+	//
+	// Never fatal — a replication tick that fails is retried on the
+	// next one, whereas failing the tick would stop the fleet's
+	// healthchecks over a transient S3 error. Bounded independently so
+	// a snapshot plus a GC sweep cannot consume the whole invocation
+	// and starve the sweep.
+	if c.ReplicationTick != nil {
+		repCtx, repCancel := context.WithTimeout(r.Context(), 20*time.Second)
+		if err := c.ReplicationTick(repCtx); err != nil {
+			slog.WarnContext(repCtx, "healthcheck tick: replication tick failed", "err", err)
+		}
+		repCancel()
+	}
+
 	if c.Registry == nil {
 		writeErr(w, http.StatusNotImplemented, "registry not wired")
 		return

@@ -108,8 +108,20 @@ func TestApplyReplicationKnobs_LambdaDefaultsRecoveryTimeout(t *testing.T) {
 	if !rep.AckWaitLiveOnly {
 		t.Error("Lambda must set AckWaitLiveOnly: a frozen predecessor container runs no heartbeat goroutine, so waiting on its ack never returns")
 	}
-	if rep.HeartbeatTTL != 3*time.Minute {
-		t.Errorf("Lambda default HeartbeatTTL = %s, want 3m", rep.HeartbeatTTL)
+	// 15m, derived from the `hc-tick` EventBridge rule's rate(5 minutes).
+	//
+	// Raised from 3m on 2026-11-25. The heartbeat is no longer renewed by
+	// a ticker goroutine — Lambda freezes those — but synchronously from
+	// the tick handler, so the TTL must outlive the DRIVING cadence, not
+	// the old 30s interval. At 3m against a 5-minute tick the slot was
+	// "renewed and then expired for 2 of every 5 minutes", which looks
+	// identical from the outside to a slot that renews fine.
+	//
+	// Keep this at >= 3x the rule's rate: Handler.TickNow measures the
+	// interval between its own calls and warns when TTL < 2x the observed
+	// cadence, so a drift between the two is loud rather than silent.
+	if rep.HeartbeatTTL != 15*time.Minute {
+		t.Errorf("Lambda default HeartbeatTTL = %s, want 15m (>= 3x the hc-tick rate(5 minutes) that now drives the renewal)", rep.HeartbeatTTL)
 	}
 	if rep.MaxReplicas != 10 {
 		t.Errorf("Lambda default MaxReplicas = %d, want 10", rep.MaxReplicas)
