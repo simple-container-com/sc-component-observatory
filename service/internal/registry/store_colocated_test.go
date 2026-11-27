@@ -341,3 +341,88 @@ func TestColocated_DeleteSweepsConfigSnapshots(t *testing.T) {
 		}
 	}
 }
+
+func TestColocated_LatestHealthReadsPointerNotHistory(t *testing.T) {
+	ctx := context.Background()
+	store, objs := colocated(t)
+
+	for i := 0; i < 60; i++ {
+		res := HealthResult{Stack: "svc--staging", Region: "eu", At: t0.Add(time.Duration(i) * time.Minute), Status: HealthUp}
+		if i == 59 {
+			res.Status = HealthDown
+		}
+		if err := store.PutHealth(ctx, res); err != nil {
+			t.Fatalf("put health: %v", err)
+		}
+	}
+	if err := store.PutHealth(ctx, HealthResult{Stack: "svc--staging", Region: "us", At: t0, Status: HealthUp}); err != nil {
+		t.Fatalf("put health: %v", err)
+	}
+
+	got, err := store.LatestHealth(ctx, "svc--staging")
+	if err != nil {
+		t.Fatalf("latest: %v", err)
+	}
+	if len(got) != 2 || got["eu"].Status != HealthDown || !got["eu"].At.Equal(t0.Add(59*time.Minute)) {
+		t.Fatalf("unexpected latest: %+v", got)
+	}
+
+	// Dropping the history must not change the answer: the pointer is
+	// what is read.
+	hist, _ := objs.List(ctx, "obs/_meta/health/svc--staging/")
+	for _, o := range hist {
+		_ = objs.Delete(ctx, o.Path)
+	}
+	got, err = store.LatestHealth(ctx, "svc--staging")
+	if err != nil || len(got) != 2 || got["eu"].Status != HealthDown {
+		t.Fatalf("latest after history drop: %+v err=%v", got, err)
+	}
+}
+
+func TestColocated_LatestHealthFallsBackToHistoryWithoutPointer(t *testing.T) {
+	ctx := context.Background()
+	store, objs := colocated(t)
+
+	legacy := HealthResult{Stack: "old--staging", Region: "eu", At: t0, Status: HealthUp}
+	if err := store.putJSON(ctx, store.healthObjectKey(legacy), legacy); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if left, _ := objs.List(ctx, "obs/_meta/health-latest/"); len(left) != 0 {
+		t.Fatalf("precondition: pointer exists: %+v", left)
+	}
+	got, err := store.LatestHealth(ctx, "old--staging")
+	if err != nil || got["eu"].Status != HealthUp {
+		t.Fatalf("fallback failed: %+v err=%v", got, err)
+	}
+}
+
+func TestColocated_PruneHealthKeepsLatestPointer(t *testing.T) {
+	ctx := context.Background()
+	store, _ := colocated(t)
+
+	if err := store.PutHealth(ctx, HealthResult{Stack: "p--staging", Region: "eu", At: t0, Status: HealthUp}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if _, err := store.PruneHealth(ctx, t0.Add(24*time.Hour)); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	got, _ := store.LatestHealth(ctx, "p--staging")
+	if got["eu"].Status != HealthUp {
+		t.Fatalf("pointer pruned: %+v", got)
+	}
+}
+
+func TestColocated_DeleteRemovesLatestHealthPointers(t *testing.T) {
+	ctx := context.Background()
+	store, objs := colocated(t)
+
+	if err := store.PutHealth(ctx, HealthResult{Stack: "d--staging", Region: "eu", At: t0, Status: HealthUp}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := store.Delete(ctx, "d--staging"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if left, _ := objs.List(ctx, "obs/_meta/health-latest/"); len(left) != 0 {
+		t.Fatalf("pointers left: %+v", left)
+	}
+}

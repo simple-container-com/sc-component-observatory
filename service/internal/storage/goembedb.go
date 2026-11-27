@@ -311,6 +311,7 @@ const (
 //	[<any-prefix>/]_meta/deploys/*        → deploys
 //	[<any-prefix>/]_meta/deploy-configs/* → deploy_configs
 //	[<any-prefix>/]_meta/health/*         → health
+//	[<any-prefix>/]_meta/health-latest/*  → health
 //
 // Anything else falls back to `kv` so a future caller that writes a
 // path outside this tree is still served, just slowly on List.
@@ -345,7 +346,8 @@ func collectionNameFor(path string) string {
 		return CollectionDeployConfigs
 	case containsSegment(path, "_meta/deploys/"):
 		return CollectionDeploys
-	case containsSegment(path, "_meta/health/"):
+	case containsSegment(path, "_meta/health/"),
+		containsSegment(path, "_meta/health-latest/"):
 		return CollectionHealth
 	}
 	// A key sitting directly at `_meta/services.json`-like paths (no

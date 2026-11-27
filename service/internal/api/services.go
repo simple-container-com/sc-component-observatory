@@ -9,10 +9,14 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/simple-container-com/sc-component-observatory/service/internal/registry"
 )
+
+// listHealthConcurrency bounds the parallel per-service health reads in List.
+const listHealthConcurrency = 8
 
 // ServicesConfig wires the registry handlers.
 type ServicesConfig struct {
@@ -185,22 +189,32 @@ func (c *ServicesConfig) List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := c.now()
-	out := make([]serviceJSON, 0, len(recs))
-	for _, rec := range recs {
-		row := toServiceJSON(rec, now)
-		// Health is read per service rather than in one bulk query
-		// because the colocated store has no cross-service index. Bounded
-		// by fleet size (tens), and LatestHealth reads one capped page.
-		if latest, err := c.Registry.LatestHealth(r.Context(), rec.Stack); err == nil {
-			status, at := summarizeHealth(latest)
-			row.Health = status
-			if !at.IsZero() {
-				row.HealthAt = at.UTC().Format(time.RFC3339)
+	out := make([]serviceJSON, len(recs))
+	// Health is read per service (the colocated store has no cross-service
+	// index), concurrently and bounded so a large fleet cannot open an
+	// unbounded number of store round-trips at once.
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, listHealthConcurrency)
+	for i, rec := range recs {
+		out[i] = toServiceJSON(rec, now)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, stack string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			latest, err := c.Registry.LatestHealth(r.Context(), stack)
+			if err != nil {
+				return
 			}
-			applyProbeVersion(&row, latest)
-		}
-		out = append(out, row)
+			status, at := summarizeHealth(latest)
+			out[i].Health = status
+			if !at.IsZero() {
+				out[i].HealthAt = at.UTC().Format(time.RFC3339)
+			}
+			applyProbeVersion(&out[i], latest)
+		}(i, rec.Stack)
 	}
+	wg.Wait()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"count":    len(out),
 		"services": out,
