@@ -235,6 +235,7 @@ func TestMongoStore_CollectionRouting(t *testing.T) {
 		"_meta/deploys/alpha/aaa.json":        storage.CollectionDeploys,
 		"_meta/deploy-configs/alpha/bbb.json": storage.CollectionDeployConfigs,
 		"_meta/health/alpha/t.json":           storage.CollectionHealth,
+		"_meta/health-latest/alpha/r.json":    storage.CollectionHealth,
 		"random/other/path.json":              storage.CollectionKV,
 	}
 	for path := range fixtures {
@@ -251,7 +252,7 @@ func TestMongoStore_CollectionRouting(t *testing.T) {
 		storage.CollectionServices:      2,
 		storage.CollectionDeploys:       1,
 		storage.CollectionDeployConfigs: 1,
-		storage.CollectionHealth:        1,
+		storage.CollectionHealth:        2,
 		storage.CollectionKV:            1,
 	}
 	for k, v := range want {

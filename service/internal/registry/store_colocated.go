@@ -202,7 +202,7 @@ func (s *ColocatedStore) Put(ctx context.Context, rec ServiceRecord) error {
 // event delete must not leave the record itself behind and make them
 // run it again.
 func (s *ColocatedStore) Delete(ctx context.Context, stack string) error {
-	for _, prefix := range []string{s.deployPrefix(stack), s.deployConfigPrefix(stack), s.healthPrefix(stack)} {
+	for _, prefix := range []string{s.deployPrefix(stack), s.deployConfigPrefix(stack), s.healthPrefix(stack), s.healthLatestPrefix(stack)} {
 		objs, err := s.objects.List(ctx, prefix)
 		if err != nil {
 			continue
@@ -294,10 +294,28 @@ func (s *ColocatedStore) DeployConfig(ctx context.Context, stack, eventID string
 
 func (s *ColocatedStore) Close(_ context.Context) error { return nil }
 
-const healthDir = "health"
+const (
+	healthDir = "health"
+	// healthLatestDir holds ONE object per stack and region: the newest
+	// probe. It is deliberately outside `health/` so PruneHealth's sweep
+	// of that prefix can never delete it, and so a history LIST never
+	// returns it.
+	healthLatestDir = "health-latest"
+)
 
 func (s *ColocatedStore) healthPrefix(stack string) string {
 	return s.key(healthDir, encodeStack(stack)) + "/"
+}
+
+func (s *ColocatedStore) healthLatestPrefix(stack string) string {
+	return s.key(healthLatestDir, encodeStack(stack)) + "/"
+}
+
+func (s *ColocatedStore) healthLatestKey(stack, region string) string {
+	if region == "" {
+		region = "default"
+	}
+	return s.healthLatestPrefix(stack) + encodeStack(region) + jsonFileExt
 }
 
 // healthObjectKey sorts lexically by time, so a prefix LIST returns
@@ -316,7 +334,14 @@ func (s *ColocatedStore) PutHealth(ctx context.Context, res HealthResult) error 
 	if res.Stack == "" {
 		return errors.New("health result has no stack")
 	}
-	return s.putJSON(ctx, s.healthObjectKey(res), res)
+	if err := s.putJSON(ctx, s.healthObjectKey(res), res); err != nil {
+		return err
+	}
+	// Best-effort: the history row just written is already durable, and
+	// LatestHealth falls back to scanning history for a stack whose
+	// pointer write failed, so a pointer error must not fail the probe.
+	_ = s.putJSON(ctx, s.healthLatestKey(res.Stack, res.Region), res)
+	return nil
 }
 
 func (s *ColocatedStore) HealthHistory(ctx context.Context, stack string, limit int) ([]HealthResult, error) {
@@ -351,7 +376,37 @@ func (s *ColocatedStore) HealthHistory(ctx context.Context, stack string, limit 
 	return out, nil
 }
 
+// LatestHealth returns the newest probe per region.
+//
+// Reads the per-region pointers PutHealth maintains: one LIST over a
+// handful of keys plus one GET each, regardless of how long the stack's
+// history has grown. Only a stack that has no pointer yet — probed
+// before pointers existed, and not probed since — pays for the history
+// scan, and the next sweep gives it one.
 func (s *ColocatedStore) LatestHealth(ctx context.Context, stack string) (map[string]HealthResult, error) {
+	objs, err := s.objects.List(ctx, s.healthLatestPrefix(stack))
+	if err != nil {
+		return nil, fmt.Errorf("list latest health: %w", err)
+	}
+	out := map[string]HealthResult{}
+	for _, o := range objs {
+		if !strings.HasSuffix(o.Path, jsonFileExt) {
+			continue
+		}
+		var res HealthResult
+		found, err := s.getJSON(ctx, o.Path, &res)
+		if err != nil || !found {
+			continue
+		}
+		out[res.Region] = res
+	}
+	if len(out) > 0 {
+		return out, nil
+	}
+	return s.latestHealthFromHistory(ctx, stack)
+}
+
+func (s *ColocatedStore) latestHealthFromHistory(ctx context.Context, stack string) (map[string]HealthResult, error) {
 	// One page is enough to cover every region's latest result in any
 	// realistic deployment, and bounds the GETs.
 	hist, err := s.HealthHistory(ctx, stack, 50)
